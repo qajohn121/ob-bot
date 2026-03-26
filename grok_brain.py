@@ -123,6 +123,19 @@ def format_scan_result(pick, regime_info, tier, rank=1):
         f"   {price_str}{bid_ask}",
         f"🛑 Stop: ${stop}   🎯 Target: ${tgt}",
     ]
+
+    # Add spread structure if available
+    sp = pick.get("spread")
+    if sp:
+        lines.append("─────────────────")
+        lines.append(f"📐 <b>{sp['spread_type']}</b>")
+        lines.append(f"   Sell ${sp['short_strike']} | Buy ${sp['long_strike']}")
+        lines.append(f"   Credit: ${sp['credit']:.2f} | Max Loss: ${sp['max_loss']:.2f}")
+        lines.append(f"   Breakeven: ${sp['breakeven']}")
+        lines.append(f"   🎯 TP50%: ${sp['take_profit_50']:.2f} | TP100%: ${sp['credit']:.2f}")
+        lines.append(f"   🛑 Stop: ${sp['stop_loss_at']:.2f}")
+        lines.append(f"   📌 {sp['bias_note']}")
+
     if thesis:
         lines.append(f"💡 {thesis}")
     return "\n".join(lines)

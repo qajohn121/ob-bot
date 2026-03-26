@@ -55,6 +55,26 @@ def get_market_regime():
         log.debug(f"VIX fetch: {e}")
     return {"regime":"UNKNOWN", "vix":0, "bias":"BOTH", "size_mult":1.0, "note":"VIX unavailable"}
 
+def get_market_context():
+    """Intraday QQQ/SPY momentum — detects broad tech selloffs and rallies."""
+    try:
+        qqq = yf.Ticker("QQQ").history(period="5d", interval="1h")
+        spy = yf.Ticker("SPY").history(period="5d", interval="1h")
+        if qqq.empty or spy.empty:
+            return {"qqq_4h": 0, "spy_4h": 0, "tech_selloff": False, "broad_selloff": False, "rally_day": False}
+        qqq_4h = (qqq["Close"].iloc[-1] / qqq["Close"].iloc[-5] - 1) * 100 if len(qqq) >= 5 else 0
+        spy_4h = (spy["Close"].iloc[-1] / spy["Close"].iloc[-5] - 1) * 100 if len(spy) >= 5 else 0
+    except Exception as e:
+        log.debug(f"Market context fetch: {e}")
+        return {"qqq_4h": 0, "spy_4h": 0, "tech_selloff": False, "broad_selloff": False, "rally_day": False}
+    return {
+        "qqq_4h": round(qqq_4h, 2),
+        "spy_4h": round(spy_4h, 2),
+        "tech_selloff": qqq_4h < -1.5,       # QQQ down 1.5%+ intraday = tech selling
+        "broad_selloff": spy_4h < -1.5,      # broad market selling
+        "rally_day": qqq_4h > 1.5 and spy_4h > 1.0,
+    }
+
 # ── Black-Scholes helpers ─────────────────────────────────────────────────────
 def _bs_delta(S,K,T,r,sigma,opt="call"):
     try:
@@ -173,6 +193,72 @@ def build_entry(d, direction, score, dte_profile="30DTE"):
         "max_contracts":max_contracts,"contract_cost":round(opt_price*100,2),
         "price_source":price_source,
         "entry_summary":summary,"dte_profile":dte_profile,
+    }
+
+def _round_strike(price, target):
+    """Round target to nearest valid strike increment."""
+    if price >= 200:  inc = 5
+    elif price >= 100: inc = 2.5
+    elif price >= 20:  inc = 1
+    else:              inc = 0.5
+    return round(target / inc) * inc
+
+def build_spread(d, direction, score, dte_profile):
+    """
+    Build a credit spread entry instead of naked option.
+    CALL signal → Bear Call Spread (sell call above price, buy higher call)
+    PUT signal  → Bull Put Spread  (sell put below price, buy lower put)
+
+    Targets 50-100% of credit received as profit (typical spread trader goal).
+    """
+    price   = d["price"]
+    iv_pct  = d.get("iv_pct", 30)
+
+    # Spread width: 5% of price, min $2.50, max $20, rounded to strike increments
+    raw_width = max(2.5, min(20, round(price * 0.05)))
+    if price >= 200:  spread_width = round(raw_width / 5) * 5
+    elif price >= 50: spread_width = round(raw_width / 2.5) * 2.5
+    else:             spread_width = round(raw_width)
+
+    # Credit target: ~30-35% of spread width (realistic for 30-45 DTE 1-sigma OTM spread)
+    credit_pct = 0.30 + (iv_pct - 30) * 0.003  # higher IV = more credit
+    credit_pct = max(0.20, min(0.45, credit_pct))
+    credit     = round(spread_width * credit_pct, 2)
+    max_loss   = round(spread_width - credit, 2)
+
+    if direction == "CALL":
+        # Bear Call Spread: sell OTM call, buy further OTM call
+        short_strike = _round_strike(price, price * 1.02)  # 2% above price
+        long_strike  = _round_strike(price, short_strike + spread_width)
+        spread_type  = "BEAR CALL SPREAD"
+        breakeven    = round(short_strike + credit, 2)
+        bias_note    = "Stock stays BELOW short strike"
+    else:
+        # Bull Put Spread: sell OTM put, buy further OTM put
+        short_strike = _round_strike(price, price * 0.98)  # 2% below price
+        long_strike  = _round_strike(price, short_strike - spread_width)
+        spread_type  = "BULL PUT SPREAD"
+        breakeven    = round(short_strike - credit, 2)
+        bias_note    = "Stock stays ABOVE short strike"
+
+    take_profit_50  = round(credit * 0.50, 2)   # close at 50% of credit (conservative)
+    take_profit_100 = credit                      # close at full credit (max profit)
+    stop_loss       = round(max_loss * 0.75, 2)  # close if spread worth 75% of max loss
+
+    return {
+        "spread_type":    spread_type,
+        "short_strike":   short_strike,
+        "long_strike":    long_strike,
+        "spread_width":   spread_width,
+        "credit":         credit,          # received per share ($×100 per contract)
+        "max_profit":     credit,
+        "max_loss":       max_loss,
+        "breakeven":      breakeven,
+        "take_profit_50": take_profit_50,
+        "take_profit_100":take_profit_100,
+        "stop_loss_at":   stop_loss,
+        "dte_profile":    dte_profile,
+        "bias_note":      bias_note,
     }
 
 # ── Fetch ticker data ─────────────────────────────────────────────────────────
@@ -377,14 +463,19 @@ def score_for_put(d, w=None):
     return min(100, max(0, score)), " | ".join(reasons[:3]) if reasons else "Bearish signals"
 
 # ── Minimum score thresholds — never show a trade below these ─────────────────
-MIN_SCORE = {"0DTE": 65, "7DTE": 55, "21DTE": 50, "30DTE": 45, "60DTE": 40}
+MIN_SCORE = {"0DTE": 70, "7DTE": 62, "21DTE": 58, "30DTE": 55, "60DTE": 50}
+
+# ── Minimum conviction gap — prevents ambiguous signals ─────────────────────
+# A signal is meaningless when call_score ≈ put_score. Require sufficient directional confidence.
+MIN_CONVICTION_GAP = {"0DTE": 20, "7DTE": 18, "21DTE": 15, "30DTE": 15, "60DTE": 12}
 
 # ── DTE Profile Pickers ───────────────────────────────────────────────────────
 def _pick_0dte(results):
-    """0DTE: explosive momentum only — >4% 4h move + >3x vol + score>=65."""
+    """0DTE: explosive momentum only — >4% 4h move + >3x vol + score>=70 + conviction gap."""
     candidates = [r for r in results
                   if abs(r["move_4h"]) > 4 and r["rel_volume"] > 3.0
-                  and max(r["call_score"], r["put_score"]) >= MIN_SCORE["0DTE"]]
+                  and max(r["call_score"], r["put_score"]) >= MIN_SCORE["0DTE"]
+                  and abs(r["call_score"] - r["put_score"]) >= MIN_CONVICTION_GAP["0DTE"]]
     if not candidates: return None
     best = max(candidates, key=lambda x: max(x["call_score"], x["put_score"]))
     direction = "CALL" if best["call_score"] >= best["put_score"] else "PUT"
@@ -393,17 +484,20 @@ def _pick_0dte(results):
     return {**best, "dte_profile":"0DTE", "direction":direction, "profile_score":score,
             "entry_call": entry if direction=="CALL" else build_entry(best,"CALL",best["call_score"],"0DTE"),
             "entry_put":  entry if direction=="PUT"  else build_entry(best,"PUT", best["put_score"], "0DTE"),
+            "spread": build_spread(best, direction, score, "0DTE"),
             "profile_reason": f"0DTE MOMENTUM: {best[direction.lower()+'_reason']}"}
 
 def _pick_7dte(results):
-    """7DTE: earnings within 1-7 days + score>=55."""
+    """7DTE: earnings within 1-7 days + score>=62 + conviction gap."""
     candidates = [r for r in results
                   if 1 <= r.get("days_to_earnings", 999) <= 7
-                  and max(r["call_score"], r["put_score"]) >= MIN_SCORE["7DTE"]]
+                  and max(r["call_score"], r["put_score"]) >= MIN_SCORE["7DTE"]
+                  and abs(r["call_score"] - r["put_score"]) >= MIN_CONVICTION_GAP["7DTE"]]
     if not candidates:  # loosen earnings window slightly
         candidates = [r for r in results
                       if 1 <= r.get("days_to_earnings", 999) <= 10
-                      and max(r["call_score"], r["put_score"]) >= MIN_SCORE["7DTE"]]
+                      and max(r["call_score"], r["put_score"]) >= MIN_SCORE["7DTE"]
+                      and abs(r["call_score"] - r["put_score"]) >= MIN_CONVICTION_GAP["7DTE"]]
     if not candidates: return None
     best = max(candidates, key=lambda x: max(x["call_score"], x["put_score"]))
     direction = "CALL" if best["call_score"] >= best["put_score"] else "PUT"
@@ -412,18 +506,21 @@ def _pick_7dte(results):
     return {**best, "dte_profile":"7DTE", "direction":direction, "profile_score":score,
             "entry_call": build_entry(best,"CALL",best["call_score"],"7DTE"),
             "entry_put":  build_entry(best,"PUT", best["put_score"], "7DTE"),
+            "spread": build_spread(best, direction, score, "7DTE"),
             "profile_reason": f"7DTE EARNINGS in {dte_val}d: {best[direction.lower()+'_reason']}"}
 
 def _pick_21dte(results):
-    """21DTE: trend continuation — SMA aligned + RSI 45-68 + score>=50."""
+    """21DTE: trend continuation — SMA aligned + RSI 45-68 + score>=58 + conviction gap."""
     candidates = [r for r in results
                   if r["above_sma20"] and r["above_sma50"]
                   and 45 <= r["rsi"] <= 68
-                  and r["call_score"] >= MIN_SCORE["21DTE"]]
+                  and r["call_score"] >= MIN_SCORE["21DTE"]
+                  and abs(r["call_score"] - r["put_score"]) >= MIN_CONVICTION_GAP["21DTE"]]
     if not candidates:  # loosen: just need score and SMA20
         candidates = [r for r in results
                       if r["above_sma20"]
-                      and max(r["call_score"], r["put_score"]) >= MIN_SCORE["21DTE"]]
+                      and max(r["call_score"], r["put_score"]) >= MIN_SCORE["21DTE"]
+                      and abs(r["call_score"] - r["put_score"]) >= MIN_CONVICTION_GAP["21DTE"]]
     if not candidates: return None
     best = max(candidates, key=lambda x: max(x["call_score"], x["put_score"]))
     direction = "CALL" if best["call_score"] >= best["put_score"] else "PUT"
@@ -431,12 +528,14 @@ def _pick_21dte(results):
     return {**best, "dte_profile":"21DTE", "direction":direction, "profile_score":score,
             "entry_call": build_entry(best,"CALL",best["call_score"],"21DTE"),
             "entry_put":  build_entry(best,"PUT", best["put_score"], "21DTE"),
+            "spread": build_spread(best, direction, score, "21DTE"),
             "profile_reason": f"21DTE TREND: {best[direction.lower()+'_reason']}"}
 
 def _pick_30dte(results):
-    """30DTE: highest-conviction call or put with score>=45."""
+    """30DTE: highest-conviction call or put with score>=55 + conviction gap."""
     candidates = [r for r in results
-                  if max(r["call_score"], r["put_score"]) >= MIN_SCORE["30DTE"]]
+                  if max(r["call_score"], r["put_score"]) >= MIN_SCORE["30DTE"]
+                  and abs(r["call_score"] - r["put_score"]) >= MIN_CONVICTION_GAP["30DTE"]]
     if not candidates: return None
     best_c = max(candidates, key=lambda x: x["call_score"])
     best_p = max(candidates, key=lambda x: x["put_score"])
@@ -447,16 +546,19 @@ def _pick_30dte(results):
     return {**best, "dte_profile":"30DTE", "direction":direction, "profile_score":score,
             "entry_call": build_entry(best,"CALL",best["call_score"],"30DTE"),
             "entry_put":  build_entry(best,"PUT", best["put_score"], "30DTE"),
+            "spread": build_spread(best, direction, score, "30DTE"),
             "profile_reason": f"30DTE STANDARD: {best[direction.lower()+'_reason']}"}
 
 def _pick_60dte(results):
-    """60DTE: macro/thesis play — war sector or high-IV + score>=40."""
+    """60DTE: macro/thesis play — war sector or high-IV + score>=50 + conviction gap."""
     candidates = [r for r in results
                   if (r.get("is_war_sector") or r["iv_pct"] > 45)
-                  and max(r["call_score"], r["put_score"]) >= MIN_SCORE["60DTE"]]
+                  and max(r["call_score"], r["put_score"]) >= MIN_SCORE["60DTE"]
+                  and abs(r["call_score"] - r["put_score"]) >= MIN_CONVICTION_GAP["60DTE"]]
     if not candidates:  # any ticker meeting minimum score
         candidates = [r for r in results
-                      if max(r["call_score"], r["put_score"]) >= MIN_SCORE["60DTE"]]
+                      if max(r["call_score"], r["put_score"]) >= MIN_SCORE["60DTE"]
+                      and abs(r["call_score"] - r["put_score"]) >= MIN_CONVICTION_GAP["60DTE"]]
     if not candidates: return None
     best = max(candidates, key=lambda x: max(x["call_score"], x["put_score"]))
     direction = "CALL" if best["call_score"] >= best["put_score"] else "PUT"
@@ -464,6 +566,7 @@ def _pick_60dte(results):
     return {**best, "dte_profile":"60DTE", "direction":direction, "profile_score":score,
             "entry_call": build_entry(best,"CALL",best["call_score"],"60DTE"),
             "entry_put":  build_entry(best,"PUT", best["put_score"], "60DTE"),
+            "spread": build_spread(best, direction, score, "60DTE"),
             "profile_reason": f"60DTE MACRO: {best[direction.lower()+'_reason']}"}
 
 # ── Main scan ─────────────────────────────────────────────────────────────────
@@ -505,16 +608,26 @@ def run_scan_dte_profiles(learning_weights=None):
     base   = run_scan(learning_weights=learning_weights)
     results = base["all_results"]
     regime  = get_market_regime()
+    mkt_ctx = get_market_context()
     bias    = regime.get("bias", "BOTH")
+
+    # Apply market context boosts: tech selloff → boost PUTs, rally day → boost CALLs
+    TECH_TICKERS = {"NVDA","AMD","PLTR","TSLA","AMZN","GOOGL","META","MSFT","AAPL","SMCI","AVGO","ARM","MRVL"}
+    for r in results:
+        if mkt_ctx.get("tech_selloff") and r["symbol"] in TECH_TICKERS:
+            r["put_score"] = min(100, r["put_score"] + 15)
+            r["put_reason"] = "📉 Tech selloff day | " + r.get("put_reason","")
+        if mkt_ctx.get("rally_day") and r["symbol"] in TECH_TICKERS:
+            r["call_score"] = min(100, r["call_score"] + 10)
 
     # Re-rank by regime bias before feeding pickers
     biased_results = _apply_regime_bias(results, regime)
 
     used_symbols = set()
     def _pick_unique(picker_fn, res):
-        # Filter out already-used symbols, fall back to full list if no unique pick
+        # Filter out already-used symbols — no fallback to prevent duplicate signals
         filtered = [r for r in res if r["symbol"] not in used_symbols]
-        pick = picker_fn(filtered if filtered else res)
+        pick = picker_fn(filtered)
         if pick:
             used_symbols.add(pick["symbol"])
             # Ensure direction matches regime bias for non-neutral picks
