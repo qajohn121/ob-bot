@@ -110,7 +110,7 @@ async def job_morning_scan(context):
             )
         await context.bot.send_message(chat_id, "\\n".join(puts_lines), parse_mode="HTML")
 
-        # ── DTE Profile picks ────────────────────────────────────────────────
+        # ── DTE Profile picks (LONG options) ────────────────────────────────
         dte_lines = ["🎯 <b>BEST PICK PER DTE TIER</b>\\n"]
         for tier in ["0DTE","7DTE","21DTE","30DTE","60DTE"]:
             p = picks.get(tier)
@@ -122,18 +122,39 @@ async def job_morning_scan(context):
             sc = p.get(f"{dk}_score", 0)
             src = "📍" if e.get("price_source") == "market" else "~"
             dte_lines.append(
-                f"  <b>{tier}</b>: {p['symbol']} [{p.get('direction')}] {sc}/100\\n"
-                f"     ${e.get('strike','?')} exp {e.get('expiry','?')} {src}${e.get('est_option_price','?')}"
+                f"  <b>{tier}</b> NAKED {p.get('direction')}: {p['symbol']} {sc}/100\\n"
+                f"     Strike ${e.get('strike','?')} exp {e.get('expiry','?')} {src}${e.get('est_option_price','?')}\\n"
             )
+
             # Auto-log ALL DTE picks as paper trades for performance tracking
             if sc >= 50:
                 try:
                     log_trade(p, p.get("direction","CALL"),
                               session="morning_auto",
                               dte_profile=tier, regime=regime.get("regime","NORMAL"))
-                    dte_lines[-1] += "  ✍️ <i>logged</i>"
+                    dte_lines[-1] += "     ✍️ <i>logged naked</i>\\n"
                 except Exception as le:
                     log.warning(f"Auto-log {tier}: {le}")
+
+            # Also show credit spread as alternative (if score >= 50)
+            sp = p.get("spread")
+            if sp and sc >= 50:
+                sp_credit = sp.get("credit", 0)
+                sp_max_loss = sp.get("max_loss", 0)
+                dte_lines.append(
+                    f"  <b>ALT — {tier} SPREAD:</b> {p['symbol']} {sp.get('spread_type','')}\\n"
+                    f"     Sell ${sp.get('short_strike','?')} / Buy ${sp.get('long_strike','?')}\\n"
+                    f"     Credit ${sp_credit}/share | Max Loss ${sp_max_loss} | TP50% ${sp.get('take_profit_50','?')}/TP100% ${sp.get('take_profit_100','?')}\\n"
+                )
+                # Also log the spread alternative for tracking
+                try:
+                    log_trade(p, p.get("direction","CALL"),
+                              session="morning_auto_spread",
+                              dte_profile=tier, regime=regime.get("regime","NORMAL"),
+                              spread_data=sp)
+                    dte_lines[-1] += "     ✍️ <i>logged spread</i>\\n"
+                except Exception as le:
+                    log.warning(f"Auto-log spread {tier}: {le}")
 
         await context.bot.send_message(chat_id, "\\n".join(dte_lines), parse_mode="HTML")
 

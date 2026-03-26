@@ -48,6 +48,11 @@ MIGRATIONS = [
     "ALTER TABLE trades ADD COLUMN dte_profile TEXT DEFAULT '30DTE'",
     "ALTER TABLE trades ADD COLUMN regime TEXT DEFAULT 'NORMAL'",
     "ALTER TABLE trades ADD COLUMN predicted_move REAL DEFAULT 0",
+    "ALTER TABLE trades ADD COLUMN is_spread INTEGER DEFAULT 0",
+    "ALTER TABLE trades ADD COLUMN short_strike REAL DEFAULT 0",
+    "ALTER TABLE trades ADD COLUMN long_strike REAL DEFAULT 0",
+    "ALTER TABLE trades ADD COLUMN credit_received REAL DEFAULT 0",
+    "ALTER TABLE trades ADD COLUMN spread_type TEXT DEFAULT ''",
 ]
 
 def init_db():
@@ -77,7 +82,7 @@ def _next_expiry():
         except: break
     return fridays[2].strftime("%Y-%m-%d") if len(fridays)>=3 else target.strftime("%Y-%m-%d")
 
-def log_trade(d, direction, sentiment=None, session="morning", dte_profile="30DTE", regime="NORMAL"):
+def log_trade(d, direction, sentiment=None, session="morning", dte_profile="30DTE", regime="NORMAL", spread_data=None):
     sent=sentiment or {}; price=d.get("price",100); iv=d.get("iv",0.30)
     opt_px  = _atm_price(price,iv,30/365); expiry=_next_expiry()
     greeks  = d.get("call_greeks" if direction=="CALL" else "put_greeks",{})
@@ -93,20 +98,31 @@ def log_trade(d, direction, sentiment=None, session="morning", dte_profile="30DT
     else:
         strike = price
     predicted_move = d.get("move_4h", 0)
+
+    # Spread-specific fields
+    is_spread = 1 if spread_data else 0
+    short_strike = spread_data.get("short_strike", 0) if spread_data else 0
+    long_strike = spread_data.get("long_strike", 0) if spread_data else 0
+    credit_received = spread_data.get("credit", 0) if spread_data else 0
+    spread_type = spread_data.get("spread_type", "") if spread_data else ""
+
     conn=_conn(); c=conn.cursor()
     c.execute("""INSERT INTO trades (created_at,symbol,direction,entry_price,entry_option_price,
         strike,expiry,call_score,put_score,direction_score,sentiment_score,reason,entry_greeks,
         rel_volume,pct_change_4h,rsi,iv_pct,war_catalyst,bankruptcy_flag,status,scan_session,
-        max_price,min_price,dte_profile,regime,predicted_move)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        max_price,min_price,dte_profile,regime,predicted_move,is_spread,short_strike,long_strike,
+        credit_received,spread_type)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (datetime.now().isoformat(),d.get("symbol",""),direction,price,round(opt_px,3),
          round(strike,2),expiry,d.get("call_score",0),d.get("put_score",0),ds,
          sent.get("composite_score",0),reason[:500],json.dumps(greeks),
          d.get("rel_volume",1.0),d.get("move_4h",0),d.get("rsi",50),d.get("iv_pct",30),
          int(sent.get("has_war_catalyst",False)),int(sent.get("has_bankruptcy",False)),
-         "OPEN",session,price,price,dte_profile,regime,predicted_move))
+         "OPEN",session,price,price,dte_profile,regime,predicted_move,
+         is_spread,short_strike,long_strike,credit_received,spread_type))
     tid=c.lastrowid; conn.commit(); conn.close()
-    log.info(f"Logged #{tid}: {d.get('symbol')} {direction} {dte_profile} @ ${price:.2f}"); return tid
+    trade_type = f"{spread_type} spread" if is_spread else f"{direction} option"
+    log.info(f"Logged #{tid}: {d.get('symbol')} {trade_type} {dte_profile} @ ${price:.2f}"); return tid
 
 # ── Autopsy: rule-based analysis of why a trade won or lost ──────────────────
 def _generate_autopsy_lesson(trade, pnl_pct, cur_price, cur_iv_pct):
