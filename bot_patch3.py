@@ -144,17 +144,18 @@ async def job_morning_scan(context):
 
 MIDDAY_REVIEW_JOB = '''
 async def job_midday_review(context):
-    """12:30 PM EST — Review open trades, P&L update, hold/adjust call."""
+    """12:30 PM EST — Real-time P&L guidance: distance to stops/targets, recommendations."""
     import traceback
     chat_id = _get_chat_id()
     if not chat_id: return
     try:
         await context.bot.send_message(chat_id,
-            "🕧 <b>MIDDAY REVIEW — 12:30 PM EST</b>", parse_mode="HTML")
+            "🕧 <b>MIDDAY REVIEW — 12:30 PM EST</b>\\nReal-time P&L guidance & trade management", parse_mode="HTML")
 
         from paper_trader import get_open_trades_with_pnl, check_open_trades
         from scanner import get_market_regime
-        import requests, os
+        import requests, os, yfinance as yf
+        from datetime import datetime
 
         regime = get_market_regime()
         closed = check_open_trades(regime.get("regime","NORMAL"))
@@ -170,26 +171,83 @@ async def job_midday_review(context):
             lines.append(f"🔒 <b>Closed {len(closed)} trade(s) at midday:</b>")
             for c in closed:
                 ico = "✅" if c["outcome"]=="WIN" else "❌"
-                lines.append(f"  {ico} {c['symbol']} {c['direction']} {c['pnl_pct']:+.1f}% — {c['reason']}")
+                lines.append(f"  {ico} {c['symbol']} {c['direction']} {c['dte_profile']} {c['pnl_pct']:+.1f}% — {c['reason']}")
 
         if trades:
-            lines.append(f"\\n📂 <b>Open positions ({len(trades)}):</b>")
+            lines.append(f"\\n📂 <b>OPEN POSITIONS ({len(trades)}) — Real-time P&L Guidance</b>\\n")
+
             for t in trades:
-                pnl = t.get("option_pnl_pct", 0) or 0
-                ico = "📈" if pnl > 0 else ("📉" if pnl < 0 else "➡️")
+                symbol = t['symbol']
+                direction = t['direction']
+                entry_price = t['entry_price']
+                current_price = t.get('current_price', entry_price)
+                option_pnl_pct = t.get('option_pnl_pct', 0) or 0
+                option_pnl_dollar = t.get('option_pnl_dollar', 0) or 0
+
+                # Get entry targets
+                entry_opt = t.get('entry_option_price') or 0
+                stop_opt = t.get('stop_loss_option') or 0
+                target_opt = t.get('target_option') or 0
+
+                # Current option price estimate
+                try:
+                    tk = yf.Ticker(symbol)
+                    hist = tk.history(period="1d", interval="5m")
+                    if not hist.empty:
+                        cur_price = float(hist["Close"].iloc[-1])
+                except:
+                    cur_price = current_price
+
+                # ═══ Traffic light system ═══
+                if option_pnl_pct >= 70:
+                    traffic = "🟢"  # Safe, consider taking profit
+                    action = "✅ STRONG PROFIT — Consider taking 50%"
+                elif option_pnl_pct >= 30:
+                    traffic = "🟢"  # Safe
+                    action = "✅ HOLD — On track to target"
+                elif option_pnl_pct >= 0:
+                    traffic = "🟡"  # Caution
+                    action = "⏸️ HOLD — Wait for 30%+ profit"
+                elif option_pnl_pct >= -30:
+                    traffic = "🟡"  # Caution, getting close to stop
+                    action = "⚠️ CAUTION — Approaching stop loss"
+                else:
+                    traffic = "🔴"  # Danger, cut loss
+                    action = "🛑 CUT LOSS — Below -30%"
+
+                # ═══ Distance calculations ═══
+                if entry_opt > 0 and stop_opt > 0:
+                    to_target = round((target_opt - entry_opt) / entry_opt * 100, 1)
+                    to_stop = round((stop_opt - entry_opt) / entry_opt * 100, 1)
+                    dist_remaining = round(option_pnl_pct - to_stop, 1)  # How far from stop
+                else:
+                    to_target = round((cur_price * 1.05 - entry_price) / entry_price * 100, 1)
+                    to_stop = round((entry_price * 0.93 - entry_price) / entry_price * 100, 1)
+                    dist_remaining = round(option_pnl_pct - to_stop, 1)
+
                 lines.append(
-                    f"  {ico} <b>{t['symbol']}</b> {t['direction']} {t.get('dte_profile','')}\\n"
-                    f"     Entry ${t['entry_price']:.2f} → Now ${t.get('current_price', t['entry_price']):.2f} "
-                    f"| Option P&L: {pnl:+.1f}%"
+                    f"{traffic} <b>{symbol}</b> {direction} {t.get('dte_profile', '')}\\n"
+                    f"   Entry ${entry_price:.2f} → ${current_price:.2f} | Option P&L: {option_pnl_pct:+.1f}% (${option_pnl_dollar:+.2f})\\n"
+                    f"   Target: ${target_opt} ({to_target:+.0f}%) | Stop: ${stop_opt} ({to_stop:+.0f}%) | Buffer: {dist_remaining:+.0f}%\\n"
+                    f"   → {action}"
                 )
 
         await context.bot.send_message(chat_id, "\\n".join(lines), parse_mode="HTML")
 
-        # Ask Grok for hold/adjust recommendation
+        # ═══ Per-trade management guide ═══
+        guide_lines = [
+            "\\n📋 <b>TRADE MANAGEMENT GUIDE</b>\\n",
+            "🟢 <b>Green (P&L +30% to +70%):</b> Stock moving right. Hold until +70% or stop hit.\\n",
+            "🟡 <b>Yellow (-30% to +0%):</b> Trending against you. Exit if stops below 5% buffer.\\n",
+            "🔴 <b>Red (P&L below -30%):</b> Theta + move against you. Cut immediately to prevent wipeout.\\n"
+        ]
+        await context.bot.send_message(chat_id, "".join(guide_lines), parse_mode="HTML")
+
+        # Ask Grok for specific trade management
         groq_key = os.getenv("GROQ_API_KEY","")
         if groq_key and trades:
             trade_summary = "; ".join(
-                f"{t['symbol']} {t['direction']} pnl={t.get('option_pnl_pct',0):+.0f}%"
+                f"{t['symbol']} {t['direction']} P&L {t.get('option_pnl_pct',0):+.0f}% (SL at {t.get('stop_loss_option',0)})"
                 for t in trades[:5]
             )
             try:
@@ -198,8 +256,8 @@ async def job_midday_review(context):
                     headers={"Authorization": f"Bearer {groq_key}", "Content-Type": "application/json"},
                     json={"model":"llama-3.3-70b-versatile",
                           "messages":[
-                              {"role":"system","content":"You are a decisive options trader. Max 3 sentences. Be specific."},
-                              {"role":"user","content":f"Midday check. Regime: {regime.get('regime')} VIX {regime.get('vix',0):.1f}. Open trades: {trade_summary}. Should I hold, take partial profits, or cut losses? Give specific guidance."}
+                              {"role":"system","content":"You are a risk-focused options trader. Max 3 sentences. Focus on PROTECTION first, profit second. Be specific about which positions to exit."},
+                              {"role":"user","content":f"Midday risk check. Regime: {regime.get('regime')} VIX {regime.get('vix',0):.1f}.\\nOpen trades: {trade_summary}\\nWhich should I close for safety? Which can hold for target?"}
                           ],
                           "max_tokens":120},
                     timeout=15
@@ -207,7 +265,7 @@ async def job_midday_review(context):
                 if resp.status_code == 200:
                     advice = resp.json()["choices"][0]["message"]["content"].strip()
                     await context.bot.send_message(chat_id,
-                        f"🤖 <b>AI Midday Guidance:</b>\\n{advice}", parse_mode="HTML")
+                        f"🤖 <b>AI Trade Management:</b>\\n{advice}", parse_mode="HTML")
             except: pass
 
     except Exception as e:
