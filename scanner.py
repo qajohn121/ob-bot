@@ -7,6 +7,19 @@ import pandas as pd
 import yfinance as yf
 from vol_analysis import hv_iv_analysis
 
+# Graceful fallback for market intelligence and sentiment imports
+try:
+    from market_intel import get_market_intel as _get_market_intel
+except ImportError:
+    def _get_market_intel():
+        return {"market_bias": "NEUTRAL", "context_summary": "", "wsb_trending": []}
+
+try:
+    from sentiment import get_social_sentiment as _get_social_sentiment
+except ImportError:
+    def _get_social_sentiment(symbol, wsb_data=None):
+        return {"composite_social_score": 50.0, "is_bearish_social": False, "is_bullish_social": False}
+
 # Suppress noisy yfinance/urllib3 HTTP error prints
 for _noisy in ("yfinance","urllib3","peewee","yfinance.utils","yfinance.base"):
     logging.getLogger(_noisy).setLevel(logging.CRITICAL)
@@ -37,6 +50,8 @@ WAR_TICKERS   = {"LMT","RTX","NOC","GD","HII","BAH","CACI","SAIC","XOM","CVX","C
 DISTRESSED_TICKERS = {"GME","AMC","BBAI","LCID","RIVN","SNAP","HOOD","MARA","RIOT","CLSK","HUT","BTBT","ARKK"}
 # ETFs have no fundamentals — skip .info for these
 ETF_TICKERS = {"SPY","QQQ","IWM","GLD","TLT","XLF","XLE","XLK","ARKK","SOXL","USO","XBI","SMH","DIA","VXX"}
+# Tech & growth tickers for market context boosts (used in multiple places)
+TECH_TICKERS = {"NVDA","AMD","PLTR","TSLA","AMZN","GOOGL","META","MSFT","AAPL","SMCI","AVGO","ARM","MRVL"}
 
 # ── Market Regime ─────────────────────────────────────────────────────────────
 def get_market_regime():
@@ -392,7 +407,8 @@ def fetch_ticker_data(symbol):
         log.debug(f"fetch {symbol}: {e}"); return None
 
 # ── Scoring ───────────────────────────────────────────────────────────────────
-def score_for_call(d, w=None):
+def score_for_call(d, w=None, sentiment=None):
+    """Score for CALL. Optional sentiment param adds -15 to +15 adjustment."""
     w=w or {}; score=0; reasons=[]
     mv=d["move_4h"]; rv=d["rel_volume"]
     if mv>8:   score+=int(30*w.get("momentum_weight",1)); reasons.append(f"🚀 +{mv:.1f}% 4h (explosive)")
@@ -423,9 +439,28 @@ def score_for_call(d, w=None):
         elif iv_sig == "VERY_RICH":                   score -= 18; reasons.append(f"IV very expensive ({iv_hv:.2f}x HV) ❌")
     else:
         if d["iv_pct"] > 50: score += 5; reasons.append(f"IV {d['iv_pct']:.0f}%")
+
+    # ── Social sentiment adjustment: -15 to +15 ────────────────────────────
+    if sentiment is not None:
+        bull_pct = sentiment.get("stocktwits_bull_pct", 50)
+        bear_pct = sentiment.get("stocktwits_bear_pct", 50)
+        wsb_score = sentiment.get("wsb_score", 0)
+        if sentiment.get("is_bullish_social"):
+            adj = min(15, int((bull_pct - 65) * 0.5) + 5)
+            score += adj
+            reasons.append(f"📱 Social bull {bull_pct:.0f}%")
+        elif sentiment.get("is_bearish_social"):
+            adj = max(-15, -int((bear_pct - 65) * 0.5) - 5)
+            score += adj
+            reasons.append(f"📱 Social bear {bear_pct:.0f}%")
+        if wsb_score >= 70:
+            score += 5
+            reasons.append(f"WSB trending #{sentiment.get('wsb_rank', 0)}")
+
     return min(100, max(0, score)), " | ".join(reasons[:3]) if reasons else "Mixed signals"
 
-def score_for_put(d, w=None):
+def score_for_put(d, w=None, sentiment=None):
+    """Score for PUT. Optional sentiment param adds -15 to +15 adjustment."""
     w=w or {}; score=0; reasons=[]
     mv=d["move_4h"]; rv=d["rel_volume"]
     if mv<-8:  score+=int(30*w.get("momentum_weight",1)); reasons.append(f"💥 {mv:.1f}% 4h (crash)")
@@ -460,6 +495,20 @@ def score_for_put(d, w=None):
         elif iv_sig == "VERY_RICH":                   score -= 18; reasons.append(f"IV very expensive ({iv_hv:.2f}x HV) ❌")
     else:
         if d["iv_pct"] > 60: score += 5; reasons.append(f"IV {d['iv_pct']:.0f}%")
+
+    # ── Social sentiment adjustment: -15 to +15 ────────────────────────────
+    if sentiment is not None:
+        bull_pct = sentiment.get("stocktwits_bull_pct", 50)
+        bear_pct = sentiment.get("stocktwits_bear_pct", 50)
+        if sentiment.get("is_bearish_social"):
+            adj = min(15, int((bear_pct - 65) * 0.5) + 5)
+            score += adj
+            reasons.append(f"📱 Social bear {bear_pct:.0f}%")
+        elif sentiment.get("is_bullish_social"):
+            adj = max(-15, -int((bull_pct - 65) * 0.5) - 5)
+            score += adj
+            reasons.append(f"📱 Social bull {bull_pct:.0f}%")
+
     return min(100, max(0, score)), " | ".join(reasons[:3]) if reasons else "Bearish signals"
 
 # ── Minimum score thresholds — never show a trade below these ─────────────────
@@ -603,16 +652,45 @@ def _apply_regime_bias(results, regime_info):
     return results  # BOTH: no re-ranking
 
 def run_scan_dte_profiles(learning_weights=None):
-    """Run full scan and return one best pick per DTE profile."""
-    log.info("Running DTE-profile scan...")
+    """Run full scan with 6-phase market intelligence integration."""
+    log.info("Running DTE-profile scan with market intelligence...")
+
+    # ── Phase 1: Market intelligence signals ────────────────────────────────
+    market_intel = _get_market_intel()
+    market_bias = market_intel.get("market_bias", "NEUTRAL")
+    wsb_data = market_intel.get("wsb_trending", [])
+    log.info(f"Market intel: {market_intel.get('context_summary', 'unavailable')}")
+
+    # ── Phase 2: Initial scan (unchanged) ──────────────────────────────────
     base   = run_scan(learning_weights=learning_weights)
     results = base["all_results"]
     regime  = get_market_regime()
     mkt_ctx = get_market_context()
     bias    = regime.get("bias", "BOTH")
 
-    # Apply market context boosts: tech selloff → boost PUTs, rally day → boost CALLs
-    TECH_TICKERS = {"NVDA","AMD","PLTR","TSLA","AMZN","GOOGL","META","MSFT","AAPL","SMCI","AVGO","ARM","MRVL"}
+    # ── Phase 3: Selective StockTwits fetch for top-20 technical scorers ────
+    # Sort by raw technical score, take top 20, fetch social sentiment for each
+    sorted_by_raw = sorted(results, key=lambda x: max(x["call_score"], x["put_score"]), reverse=True)
+    top20_symbols = set([r["symbol"] for r in sorted_by_raw[:20]])
+    log.info(f"Fetching social sentiment for top-20: {list(top20_symbols)[:5]}...")
+
+    for r in results:
+        if r["symbol"] in top20_symbols:
+            try:
+                time.sleep(0.3)  # Rate limit protection for StockTwits
+                sent = _get_social_sentiment(r["symbol"], wsb_data)
+                # Re-score with sentiment adjustment
+                new_cs, new_cr = score_for_call(r, learning_weights, sent)
+                new_ps, new_pr = score_for_put(r, learning_weights, sent)
+                r["call_score"] = new_cs
+                r["put_score"] = new_ps
+                r["call_reason"] = new_cr
+                r["put_reason"] = new_pr
+                r["social_sentiment"] = sent
+            except Exception as e:
+                log.debug(f"Social sentiment {r['symbol']}: {e}")
+
+    # ── Phase 4: Apply QQQ/SPY context boosts ──────────────────────────────
     for r in results:
         if mkt_ctx.get("tech_selloff") and r["symbol"] in TECH_TICKERS:
             r["put_score"] = min(100, r["put_score"] + 15)
@@ -620,6 +698,24 @@ def run_scan_dte_profiles(learning_weights=None):
         if mkt_ctx.get("rally_day") and r["symbol"] in TECH_TICKERS:
             r["call_score"] = min(100, r["call_score"] + 10)
 
+    # ── Phase 5: Apply market intel global boosts ──────────────────────────
+    if market_bias == "STRONG_PUTS":
+        for r in results:
+            if r["symbol"] in TECH_TICKERS:
+                r["put_score"] = min(100, r["put_score"] + 20)
+                r["put_reason"] = "🌐 STRONG_PUTS market | " + r.get("put_reason", "")
+    elif market_bias == "PUTS":
+        for r in results:
+            r["put_score"] = min(100, r["put_score"] + 8)
+    elif market_bias == "STRONG_CALLS":
+        for r in results:
+            if r["symbol"] in TECH_TICKERS:
+                r["call_score"] = min(100, r["call_score"] + 20)
+    elif market_bias == "CALLS":
+        for r in results:
+            r["call_score"] = min(100, r["call_score"] + 8)
+
+    # ── Phase 6: Re-rank and run DTE pickers ───────────────────────────────
     # Re-rank by regime bias before feeding pickers
     biased_results = _apply_regime_bias(results, regime)
 
@@ -644,7 +740,7 @@ def run_scan_dte_profiles(learning_weights=None):
         "30DTE": _pick_unique(_pick_30dte, biased_results),
         "60DTE": _pick_unique(_pick_60dte, biased_results),
     }
-    return {**base, "dte_picks":picks, "regime":regime}
+    return {**base, "dte_picks":picks, "regime":regime, "market_intel":market_intel}
 
 if __name__=="__main__":
     logging.basicConfig(level=logging.INFO,format="%(asctime)s [%(levelname)s] %(message)s")

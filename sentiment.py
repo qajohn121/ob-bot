@@ -33,7 +33,12 @@ BANKRUPTCY_KEYWORDS = [
 
 # ── In-memory cache: {symbol: (timestamp, result)} ────────────────────────────
 _SENT_CACHE: dict = {}
-CACHE_TTL = 1800  # 30 minutes
+_ST_CACHE: dict = {}       # StockTwits per-ticker cache
+_SOCIAL_CACHE: dict = {}   # Combined social sentiment cache
+
+CACHE_TTL = 1800           # 30 minutes
+TTL_STOCKTWITS = 900       # 15 minutes (rate limit risk)
+TTL_SOCIAL = 900           # 15 minutes
 
 
 def get_yfinance_sentiment(symbol):
@@ -139,15 +144,219 @@ def get_sec_signals(symbol):
         return {"going_concern": False, "bankruptcy": False, "distress_score": 0, "signals": [], "source": "sec"}
 
 
+def get_stocktwits_sentiment(symbol):
+    """
+    Fetches StockTwits stream for symbol, parses bull/bear sentiment from last 30 messages.
+    No API key required. TTL: 15 min (rate limit conscious).
+    Returns: {bull_pct, bear_pct, total_messages, labeled_count, source}
+    """
+    now = time.time()
+    if symbol in _ST_CACHE:
+        ts, cached = _ST_CACHE[symbol]
+        if now - ts < TTL_STOCKTWITS:
+            return cached
+
+    try:
+        url = f"https://api.stocktwits.com/api/2/streams/symbol/{symbol}.json"
+        headers = {"User-Agent": "Mozilla/5.0 (compatible; OBBot/1.0)"}
+        resp = requests.get(url, headers=headers, timeout=8)
+
+        if resp.status_code == 429:
+            result = {
+                "bull_pct": 50.0, "bear_pct": 50.0,
+                "total_messages": 0, "labeled_count": 0,
+                "source": "stocktwits_ratelimited"
+            }
+            _ST_CACHE[symbol] = (now, result)
+            return result
+
+        if resp.status_code != 200:
+            result = {
+                "bull_pct": 50.0, "bear_pct": 50.0,
+                "total_messages": 0, "labeled_count": 0,
+                "source": "stocktwits_unavailable"
+            }
+            _ST_CACHE[symbol] = (now, result)
+            return result
+
+        messages = resp.json().get("messages", [])
+        total_messages = len(messages)
+
+        bull_count = 0
+        bear_count = 0
+        for msg in messages[:30]:
+            entities = msg.get("entities", {})
+            sentiment = entities.get("sentiment", {})
+            basic = sentiment.get("basic")
+            if basic == "Bullish":
+                bull_count += 1
+            elif basic == "Bearish":
+                bear_count += 1
+
+        labeled_count = bull_count + bear_count
+        if labeled_count > 0:
+            bull_pct = bull_count / labeled_count * 100
+            bear_pct = bear_count / labeled_count * 100
+        else:
+            bull_pct = 50.0
+            bear_pct = 50.0
+
+        result = {
+            "bull_pct": round(bull_pct, 1),
+            "bear_pct": round(bear_pct, 1),
+            "total_messages": total_messages,
+            "labeled_count": labeled_count,
+            "source": "stocktwits"
+        }
+        _ST_CACHE[symbol] = (now, result)
+        return result
+
+    except Exception as e:
+        log.debug(f"stocktwits {symbol}: {e}")
+        result = {
+            "bull_pct": 50.0, "bear_pct": 50.0,
+            "total_messages": 0, "labeled_count": 0,
+            "source": "stocktwits_error"
+        }
+        _ST_CACHE[symbol] = (now, result)
+        return result
+
+
+def get_wsb_mention_score(symbol, wsb_data=None):
+    """
+    Scores WSB mention rank. Pure computation on pre-fetched ApeWisdom data.
+    wsb_data: list of {ticker, mentions, rank, rank_change_24h}
+    Returns: {wsb_score, rank, mentions, rank_change_24h, in_wsb_top}
+    No API call — no caching needed.
+    """
+    if not wsb_data:
+        wsb_data = []
+
+    # Find symbol in wsb_data
+    target = None
+    for w in wsb_data:
+        if w.get("ticker") == symbol:
+            target = w
+            break
+
+    if target is None:
+        return {
+            "wsb_score": 0, "rank": 0, "mentions": 0,
+            "rank_change_24h": 0, "in_wsb_top": False
+        }
+
+    rank = target.get("rank", 0)
+    mentions = target.get("mentions", 0)
+    rank_change_24h = target.get("rank_change_24h", 0)
+
+    # Base score by rank
+    if rank <= 3:
+        base = 80
+    elif rank <= 10:
+        base = 60
+    elif rank <= 25:
+        base = 40
+    elif rank <= 50:
+        base = 20
+    else:
+        base = 0
+
+    # Rank change bonus
+    if rank_change_24h > 20:
+        change_bonus = 20
+    elif rank_change_24h > 10:
+        change_bonus = 15
+    elif rank_change_24h > 5:
+        change_bonus = 10
+    elif rank_change_24h > 0:
+        change_bonus = 5
+    elif rank_change_24h < -10:
+        change_bonus = -10
+    elif rank_change_24h < -5:
+        change_bonus = -5
+    else:
+        change_bonus = 0
+
+    wsb_score = min(100, max(0, base + change_bonus))
+
+    return {
+        "wsb_score": wsb_score, "rank": rank, "mentions": mentions,
+        "rank_change_24h": rank_change_24h, "in_wsb_top": True
+    }
+
+
+def get_social_sentiment(symbol, wsb_data=None):
+    """
+    Fast-path social sentiment: StockTwits + WSB only (no news, no SEC).
+    Returns composite score 0-100 for use in quick decision making.
+    TTL: 15 min.
+    """
+    now = time.time()
+    if symbol in _SOCIAL_CACHE:
+        ts, cached = _SOCIAL_CACHE[symbol]
+        if now - ts < TTL_SOCIAL:
+            return cached
+
+    try:
+        st = get_stocktwits_sentiment(symbol)
+        wsb = get_wsb_mention_score(symbol, wsb_data or [])
+
+        # Convert StockTwits bull_pct to 0-100 scale
+        st_score = st.get("bull_pct", 50.0)
+
+        # Composite: StockTwits 70%, WSB 30%
+        composite_social_score = st_score * 0.70 + wsb.get("wsb_score", 0) * 0.30
+
+        result = {
+            "composite_social_score": round(composite_social_score, 1),
+            "stocktwits_bull_pct": st.get("bull_pct", 50.0),
+            "stocktwits_bear_pct": st.get("bear_pct", 50.0),
+            "wsb_score": wsb.get("wsb_score", 0),
+            "wsb_rank": wsb.get("rank", 0),
+            "is_bearish_social": st.get("bear_pct", 50.0) > 65,
+            "is_bullish_social": st.get("bull_pct", 50.0) > 65,
+            "source": "social_composite"
+        }
+        _SOCIAL_CACHE[symbol] = (now, result)
+        return result
+
+    except Exception as e:
+        log.debug(f"social_sentiment {symbol}: {e}")
+        result = {
+            "composite_social_score": 50.0,
+            "stocktwits_bull_pct": 50.0,
+            "stocktwits_bear_pct": 50.0,
+            "wsb_score": 0,
+            "wsb_rank": 0,
+            "is_bearish_social": False,
+            "is_bullish_social": False,
+            "source": "social_error"
+        }
+        _SOCIAL_CACHE[symbol] = (now, result)
+        return result
+
+
 def _compute_full_sentiment(symbol):
-    """Internal — do the actual API calls."""
+    """Internal — do the actual API calls. New weight distribution includes social sentiment."""
     yf_s   = get_yfinance_sentiment(symbol)
     news_s = get_newsapi_sentiment(symbol)
     sec_s  = get_sec_signals(symbol)
+    st_s   = get_stocktwits_sentiment(symbol)  # NEW
+    wsb_s  = get_wsb_mention_score(symbol, [])  # NEW (no pre-fetched wsb_data here)
 
+    # Convert StockTwits bull_pct (0-100) to -100..+100 sentiment scale
+    # bull_pct=50 → neutral (0), bull_pct=80 → bullish (+60), bull_pct=20 → bearish (-60)
+    st_score = (st_s.get("bull_pct", 50) - 50) * 2
+
+    # WSB score 0-100, map to -60..+60 contribution
+    wsb_contrib = (wsb_s.get("wsb_score", 0) - 50) * 1.2
+
+    # New weight distribution: yf 20%, news 20%, ST 40%, wsb 10%, sec 10%
     composite = (
-        yf_s.get("score",   0) * 0.40 +
-        news_s.get("score", 0) * 0.50 +
+        yf_s.get("score",   0) * 0.20 +
+        news_s.get("score", 0) * 0.20 +
+        st_score               * 0.40 +
+        wsb_contrib            * 0.10 +
         (-sec_s.get("distress_score", 0)) * 0.10
     )
     composite = max(-100, min(100, composite))
@@ -158,6 +367,9 @@ def _compute_full_sentiment(symbol):
         "label": "bullish" if composite > 15 else ("bearish" if composite < -15 else "neutral"),
         "yfinance_score":  yf_s.get("score",  0),
         "newsapi_score":   news_s.get("score", 0),
+        "stocktwits_bull_pct": st_s.get("bull_pct", 50.0),
+        "stocktwits_bear_pct": st_s.get("bear_pct", 50.0),
+        "wsb_score": wsb_s.get("wsb_score", 0),
         "sec_distress":    sec_s.get("distress_score", 0),
         "has_war_catalyst": war_hits >= 2,
         "has_bankruptcy":   bank_hits >= 3 or sec_s.get("bankruptcy") or sec_s.get("going_concern"),

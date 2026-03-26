@@ -62,10 +62,11 @@ def _call_grok(system_prompt, user_prompt, max_tokens=400, temperature=0.4):
 
 # ── Telegram message formatters ───────────────────────────────────────────────
 
-def format_scan_result(pick, regime_info, tier, rank=1):
+def format_scan_result(pick, regime_info, tier, rank=1, market_intel=None):
     """
     Format a single DTE-profile pick into a clean Telegram message.
     Grok adds a one-line trade thesis. Falls back to template if Grok unavailable.
+    market_intel: optional dict with market_bias, fear_greed, pc_ratio, wsb_trending.
     """
     if not pick:
         return f"<b>{tier}</b>: No qualifying setup right now."
@@ -118,11 +119,27 @@ def format_scan_result(pick, regime_info, tier, rank=1):
         f"${price:.2f}  4h:{move:+.1f}%  Vol:{vol:.1f}x  RSI:{rsi:.0f}",
         f"{iv_line}",
         f"Regime: <b>{regime}</b>",
+    ]
+
+    # Add market intelligence line if available
+    if market_intel:
+        fg_val  = market_intel.get("fear_greed", {}).get("value", 50)
+        fg_label = market_intel.get("fear_greed", {}).get("label", "Neutral")
+        pc_val  = market_intel.get("pc_ratio", {}).get("pc_ratio", 0.85)
+        wsb_str = ""
+        for w in market_intel.get("wsb_trending", [])[:10]:
+            if w.get("ticker") == symbol:
+                arrow = "↑" if w.get("rank_change_24h", 0) > 0 else ("↓" if w.get("rank_change_24h", 0) < 0 else "")
+                wsb_str = f" | WSB: {symbol}#{w['rank']}{arrow}"
+                break
+        lines.append(f"📊 F&G: {fg_val} ({fg_label}) | P/C: {pc_val:.2f}{wsb_str}")
+
+    lines.extend([
         "─────────────────",
         f"📋 <b>Buy {direction} ${strike}</b> exp {expiry} ({dte_val}DTE)",
         f"   {price_str}{bid_ask}",
         f"🛑 Stop: ${stop}   🎯 Target: ${tgt}",
-    ]
+    ])
 
     # Add spread structure if available
     sp = pick.get("spread")
