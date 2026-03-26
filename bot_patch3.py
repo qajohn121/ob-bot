@@ -189,85 +189,114 @@ async def job_midday_review(context):
         await context.bot.send_message(chat_id,
             "🕧 <b>MIDDAY REVIEW — 12:30 PM EST</b>\\nReal-time P&L guidance & trade management", parse_mode="HTML")
 
-        from paper_trader import get_open_trades_with_pnl, check_open_trades
+        from paper_trader import get_open_trades_with_pnl, check_open_trades, get_todays_trades
         from scanner import get_market_regime
         import requests, os, yfinance as yf
         from datetime import datetime
 
         regime = get_market_regime()
         closed = check_open_trades(regime.get("regime","NORMAL"))
-        trades = get_open_trades_with_pnl()
+        all_today = get_todays_trades()  # All trades from today regardless of status
+        trades = get_open_trades_with_pnl()  # Only OPEN trades for live tracking
 
-        if not trades and not closed:
+        if not all_today:
             await context.bot.send_message(chat_id,
-                "📭 No open positions to review. Use /ob to run a scan.")
+                "📭 No trades from this morning yet. Wait for /ob morning scan.")
             return
 
+        # ═══ Group today's trades by recommendation source ═══
+        by_source = {}
+        for t in all_today:
+            source = t.get("recommendation_source", "manual")
+            if source not in by_source:
+                by_source[source] = []
+            by_source[source].append(t)
+
         lines = []
+
+        # Show closed trades first
         if closed:
             lines.append(f"🔒 <b>Closed {len(closed)} trade(s) at midday:</b>")
             for c in closed:
                 ico = "✅" if c["outcome"]=="WIN" else "❌"
-                lines.append(f"  {ico} {c['symbol']} {c['direction']} {c['dte_profile']} {c['pnl_pct']:+.1f}% — {c['reason']}")
+                source = c.get("recommendation_source", "")
+                source_str = f" ({source})" if source else ""
+                lines.append(f"  {ico} {c['symbol']} {c['direction']} {c.get('dte_profile','')} {c['pnl_pct']:+.1f}% — {c['reason']}{source_str}")
 
-        if trades:
-            lines.append(f"\\n📂 <b>OPEN POSITIONS ({len(trades)}) — Real-time P&L Guidance</b>\\n")
+        # ═══ Show all OPEN trades from today grouped by recommendation source ═══
+        open_only = [t for t in all_today if t.get("status") == "OPEN"]
+        if open_only:
+            lines.append(f"\\n📊 <b>TODAY'S TRADES IN PLAY ({len(open_only)}) — Real-time P&L Guidance</b>\\n")
 
-            for t in trades:
-                symbol = t['symbol']
-                direction = t['direction']
-                entry_price = t['entry_price']
-                current_price = t.get('current_price', entry_price)
-                option_pnl_pct = t.get('option_pnl_pct', 0) or 0
-                option_pnl_dollar = t.get('option_pnl_dollar', 0) or 0
+            # Sort by recommendation source for better organization
+            source_order = ["top_call", "top_put", "dte_pick", "dte_spread", "manual"]
+            for src in source_order:
+                src_trades = [t for t in open_only if t.get("recommendation_source") == src]
+                if not src_trades:
+                    continue
 
-                # Get entry targets
-                entry_opt = t.get('entry_option_price') or 0
-                stop_opt = t.get('stop_loss_option') or 0
-                target_opt = t.get('target_option') or 0
+                # Category header
+                src_names = {"top_call": "🚀 Top 5 Calls", "top_put": "💥 Top 5 Puts",
+                            "dte_pick": "🎯 DTE Picks", "dte_spread": "📐 Spreads", "manual": "📌 Manual"}
+                lines.append(f"\\n<b>{src_names.get(src, src)}</b>")
 
-                # Current option price estimate
-                try:
-                    tk = yf.Ticker(symbol)
-                    hist = tk.history(period="1d", interval="5m")
-                    if not hist.empty:
-                        cur_price = float(hist["Close"].iloc[-1])
-                except:
-                    cur_price = current_price
+                for t in src_trades:
+                    symbol = t['symbol']
+                    direction = t['direction']
+                    entry_price = t['entry_price']
+                    current_price = t.get('current_price', entry_price)
+                    option_pnl_pct = t.get('option_pnl_pct', 0) or 0
+                    option_pnl_dollar = t.get('option_pnl_dollar', 0) or 0
+                    rank = t.get('recommendation_rank', 0)
+                    rank_str = f" #{rank}" if rank else ""
 
-                # ═══ Traffic light system ═══
-                if option_pnl_pct >= 70:
-                    traffic = "🟢"  # Safe, consider taking profit
-                    action = "✅ STRONG PROFIT — Consider taking 50%"
-                elif option_pnl_pct >= 30:
-                    traffic = "🟢"  # Safe
-                    action = "✅ HOLD — On track to target"
-                elif option_pnl_pct >= 0:
-                    traffic = "🟡"  # Caution
-                    action = "⏸️ HOLD — Wait for 30%+ profit"
-                elif option_pnl_pct >= -30:
-                    traffic = "🟡"  # Caution, getting close to stop
-                    action = "⚠️ CAUTION — Approaching stop loss"
-                else:
-                    traffic = "🔴"  # Danger, cut loss
-                    action = "🛑 CUT LOSS — Below -30%"
+                    # Get entry targets
+                    entry_opt = t.get('entry_option_price') or 0
+                    stop_opt = t.get('stop_loss_option') or 0
+                    target_opt = t.get('target_option') or 0
 
-                # ═══ Distance calculations ═══
-                if entry_opt > 0 and stop_opt > 0:
-                    to_target = round((target_opt - entry_opt) / entry_opt * 100, 1)
-                    to_stop = round((stop_opt - entry_opt) / entry_opt * 100, 1)
-                    dist_remaining = round(option_pnl_pct - to_stop, 1)  # How far from stop
-                else:
-                    to_target = round((cur_price * 1.05 - entry_price) / entry_price * 100, 1)
-                    to_stop = round((entry_price * 0.93 - entry_price) / entry_price * 100, 1)
-                    dist_remaining = round(option_pnl_pct - to_stop, 1)
+                    # Current option price estimate
+                    try:
+                        tk = yf.Ticker(symbol)
+                        hist = tk.history(period="1d", interval="5m")
+                        if not hist.empty:
+                            cur_price = float(hist["Close"].iloc[-1])
+                    except:
+                        cur_price = current_price
 
-                lines.append(
-                    f"{traffic} <b>{symbol}</b> {direction} {t.get('dte_profile', '')}\\n"
-                    f"   Entry ${entry_price:.2f} → ${current_price:.2f} | Option P&L: {option_pnl_pct:+.1f}% (${option_pnl_dollar:+.2f})\\n"
-                    f"   Target: ${target_opt} ({to_target:+.0f}%) | Stop: ${stop_opt} ({to_stop:+.0f}%) | Buffer: {dist_remaining:+.0f}%\\n"
-                    f"   → {action}"
-                )
+                    # ═══ Traffic light system ═══
+                    if option_pnl_pct >= 70:
+                        traffic = "🟢"  # Safe, consider taking profit
+                        action = "✅ STRONG PROFIT — Consider taking 50%"
+                    elif option_pnl_pct >= 30:
+                        traffic = "🟢"  # Safe
+                        action = "✅ HOLD — On track to target"
+                    elif option_pnl_pct >= 0:
+                        traffic = "🟡"  # Caution
+                        action = "⏸️ HOLD — Wait for 30%+ profit"
+                    elif option_pnl_pct >= -30:
+                        traffic = "🟡"  # Caution, getting close to stop
+                        action = "⚠️ CAUTION — Approaching stop loss"
+                    else:
+                        traffic = "🔴"  # Danger, cut loss
+                        action = "🛑 CUT LOSS — Below -30%"
+
+                    # ═══ Distance calculations ═══
+                    if entry_opt > 0 and stop_opt > 0:
+                        to_target = round((target_opt - entry_opt) / entry_opt * 100, 1)
+                        to_stop = round((stop_opt - entry_opt) / entry_opt * 100, 1)
+                        dist_remaining = round(option_pnl_pct - to_stop, 1)  # How far from stop
+                    else:
+                        to_target = round((cur_price * 1.05 - entry_price) / entry_price * 100, 1)
+                        to_stop = round((entry_price * 0.93 - entry_price) / entry_price * 100, 1)
+                        dist_remaining = round(option_pnl_pct - to_stop, 1)
+
+                    lines.append(
+                        f"{traffic} <b>{symbol}{rank_str}</b> {direction} {t.get('dte_profile', '')}\\n"
+                        f"   Entry ${entry_price:.2f} → ${current_price:.2f} | Option P&L: {option_pnl_pct:+.1f}% (${option_pnl_dollar:+.2f})\\n"
+                        f"   Target: ${target_opt} ({to_target:+.0f}%) | Stop: ${stop_opt} ({to_stop:+.0f}%) | Buffer: {dist_remaining:+.0f}%\\n"
+                        f"   → {action}"
+                    )
 
         await context.bot.send_message(chat_id, "\\n".join(lines), parse_mode="HTML")
 

@@ -347,6 +347,22 @@ def get_performance_stats():
         "recent_trades":closed[:10],"open_positions":open_list,
     }
 
+def get_todays_trades():
+    """Get all trades created TODAY, regardless of status (OPEN, WIN, LOSS)."""
+    from datetime import datetime, timedelta
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    try:
+        conn = _conn()
+        trades = [dict(r) for r in conn.execute(
+            "SELECT * FROM trades WHERE DATE(created_at)=? ORDER BY created_at DESC",
+            (today_str,)
+        ).fetchall()]
+        conn.close()
+        return trades
+    except Exception as e:
+        log.error(f"get_todays_trades: {e}")
+        return []
+
 def get_open_trades_with_pnl():
     conn=_conn(); trades=[dict(r) for r in conn.execute("SELECT * FROM trades WHERE status='OPEN' ORDER BY created_at DESC").fetchall()]; conn.close()
     result=[]
