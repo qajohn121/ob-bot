@@ -112,7 +112,6 @@ async def job_morning_scan(context):
 
         # ── DTE Profile picks ────────────────────────────────────────────────
         dte_lines = ["🎯 <b>BEST PICK PER DTE TIER</b>\\n"]
-        logged = 0
         for tier in ["0DTE","7DTE","21DTE","30DTE","60DTE"]:
             p = picks.get(tier)
             if not p:
@@ -126,16 +125,15 @@ async def job_morning_scan(context):
                 f"  <b>{tier}</b>: {p['symbol']} [{p.get('direction')}] {sc}/100\\n"
                 f"     ${e.get('strike','?')} exp {e.get('expiry','?')} {src}${e.get('est_option_price','?')}"
             )
-            # Auto-log top DTE pick as paper trade (21DTE or 30DTE preferred)
-            if tier in ("21DTE","30DTE") and logged == 0 and sc >= 50:
+            # Auto-log ALL DTE picks as paper trades for performance tracking
+            if sc >= 50:
                 try:
                     log_trade(p, p.get("direction","CALL"),
                               session="morning_auto",
                               dte_profile=tier, regime=regime.get("regime","NORMAL"))
                     dte_lines[-1] += "  ✍️ <i>logged</i>"
-                    logged += 1
                 except Exception as le:
-                    log.warning(f"Auto-log failed: {le}")
+                    log.warning(f"Auto-log {tier}: {le}")
 
         await context.bot.send_message(chat_id, "\\n".join(dte_lines), parse_mode="HTML")
 
@@ -219,17 +217,17 @@ async def job_midday_review(context):
 
 EOD_REVIEW_JOB = '''
 async def job_eod_review(context):
-    """3:30 PM EST — Close trades, run learning, send tomorrow's strategy."""
+    """3:30 PM EST — Close trades, run learning cycle, detailed performance analysis."""
     import traceback
     chat_id = _get_chat_id()
     if not chat_id: return
     try:
         await context.bot.send_message(chat_id,
-            "🌆 <b>EOD REVIEW — 3:30 PM EST</b>\\nRunning end-of-day analysis...",
+            "🌆 <b>EOD REVIEW — 3:30 PM EST</b>\\nRunning comprehensive end-of-day analysis...",
             parse_mode="HTML")
 
         from paper_trader import check_open_trades, get_performance_stats, get_lessons
-        from learner import run_learning_cycle, get_ev_by_dte
+        from learner import run_learning_cycle, get_ev_by_dte, get_signal_summary
         from scanner import get_market_regime
         import requests, os
 
@@ -241,65 +239,104 @@ async def job_eod_review(context):
         # Run full learning cycle
         learning = run_learning_cycle()
         stats    = get_performance_stats()
-        lessons  = get_lessons(5)
+        lessons  = get_lessons(10)
+        dte_ev   = get_ev_by_dte()
+        sig_acc  = get_signal_summary()
 
-        # ── Today's results ─────────────────────────────────────────────────
-        result_lines = ["📊 <b>TODAY'S RESULTS</b>\\n"]
+        # ────────────────────────────────────────────────────────────────────────
+        # ── TODAY'S TRADE RESULTS (detailed) ──────────────────────────────────
+        result_lines = ["📊 <b>TODAY'S TRADE RESULTS</b>\\n"]
         if closed:
+            result_lines.append(f"Closed {len(closed)} trade(s) at end of day:\\n")
             for c in closed:
                 ico = "✅" if c["outcome"]=="WIN" else "❌"
-                result_lines.append(f"  {ico} {c['symbol']} {c['direction']} {c['dte_profile']} {c['pnl_pct']:+.1f}%")
+                result_lines.append(
+                    f"  {ico} <b>{c['symbol']}</b> {c['direction']} {c['dte_profile']}\\n"
+                    f"     {c['pnl_pct']:+.1f}% P&L ({c.get('reason','')}) | Days held: {c.get('days_held',0)}"
+                )
         else:
             result_lines.append("  No trades closed today.")
 
-        result_lines.append(
-            f"\\n📈 <b>Overall stats:</b>\\n"
-            f"  Win rate: {stats['win_rate']:.0f}%  |  "
-            f"EV: {stats['expectancy']:+.1f}%  |  "
-            f"Total P&L: ${stats['total_pnl_dollar']:+.2f}"
-        )
-
-        # ── Learning update ─────────────────────────────────────────────────
-        if learning.get("adjustments"):
-            result_lines.append(f"\\n🧠 <b>Learning updates:</b>")
-            for adj in learning["adjustments"][:3]:
-                result_lines.append(f"  • {adj}")
-
-        # ── Recent lessons ──────────────────────────────────────────────────
-        if lessons:
-            result_lines.append(f"\\n📚 <b>Key lessons:</b>")
-            for l in lessons[:3]:
-                ico = "✅" if l.get("outcome")=="WIN" else "❌"
-                result_lines.append(f"  {ico} {l['symbol']}: {(l.get('lesson') or '')[:80]}")
-
         await context.bot.send_message(chat_id, "\\n".join(result_lines), parse_mode="HTML")
 
-        # ── Tomorrow's strategy via Grok ────────────────────────────────────
+        # ────────────────────────────────────────────────────────────────────────
+        # ── PERFORMANCE BY DTE TIER ──────────────────────────────────────────
+        dte_lines = ["📈 <b>PERFORMANCE BY DTE TIER (All-Time)</b>\\n"]
+        for tier in ["0DTE", "7DTE", "21DTE", "30DTE", "60DTE"]:
+            s = dte_ev.get(tier, {})
+            if s.get("trades", 0) > 0:
+                dte_lines.append(
+                    f"  <b>{tier}</b>: {s['trades']} trades | "
+                    f"WR {s['win_rate']:.0f}% | Avg P&L {s['avg_pnl']:+.1f}% | EV {s['ev']:+.1f}%"
+                )
+        if len(dte_lines) == 1:
+            dte_lines.append("  Not enough data yet.")
+
+        await context.bot.send_message(chat_id, "\\n".join(dte_lines), parse_mode="HTML")
+
+        # ────────────────────────────────────────────────────────────────────────
+        # ── SIGNAL ACCURACY (what's working/failing) ──────────────────────────
+        sig_lines = ["⚡ <b>SIGNAL ACCURACY (Which signals work best)</b>\\n"]
+        for s in sig_acc[:5]:
+            if s['total'] >= 3:
+                trend = "📈" if s['win_rate'] > 60 else ("📉" if s['win_rate'] < 40 else "➡️")
+                sig_lines.append(
+                    f"  {trend} <b>{s['signal']}</b>: {s['win_rate']:.0f}% WR ({s['total']} trades)"
+                )
+        if len(sig_lines) == 1:
+            sig_lines.append("  Not enough data yet (need 3+ trades per signal).")
+
+        await context.bot.send_message(chat_id, "\\n".join(sig_lines), parse_mode="HTML")
+
+        # ────────────────────────────────────────────────────────────────────────
+        # ── LEARNING CYCLE ADJUSTMENTS ───────────────────────────────────────
+        learn_lines = ["🧠 <b>LEARNING CYCLE — Weight & Threshold Adjustments</b>\\n"]
+        if learning.get("adjustments"):
+            for adj in learning["adjustments"]:
+                learn_lines.append(f"  🔄 {adj}")
+        else:
+            learn_lines.append("  No significant adjustments this cycle.")
+
+        await context.bot.send_message(chat_id, "\\n".join(learn_lines), parse_mode="HTML")
+
+        # ────────────────────────────────────────────────────────────────────────
+        # ── KEY LESSONS LEARNED ──────────────────────────────────────────────
+        if lessons:
+            less_lines = ["📚 <b>KEY LESSONS FROM CLOSED TRADES</b>\\n"]
+            for l in lessons[:5]:
+                ico = "✅" if l.get("outcome")=="WIN" else "❌"
+                less_lines.append(
+                    f"  {ico} <b>{l['symbol']}</b> ({l.get('dte_profile','')}): {(l.get('lesson') or '')[:100]}"
+                )
+            await context.bot.send_message(chat_id, "\\n".join(less_lines), parse_mode="HTML")
+
+        # ────────────────────────────────────────────────────────────────────────
+        # ── TOMORROW'S STRATEGY via Grok ─────────────────────────────────────
         groq_key = os.getenv("GROQ_API_KEY","")
         if groq_key:
-            dte_ev = get_ev_by_dte()
             ev_summary = "; ".join(
-                f"{k}: WR={v['win_rate']:.0f}% EV={v['ev']:+.1f}%"
+                f"{k}: WR {v['win_rate']:.0f}% EV {v['ev']:+.1f}%"
                 for k,v in dte_ev.items() if v.get("trades",0)>0
             ) or "no data yet"
-            lessons_txt = " | ".join(
-                (l.get("lesson") or "")[:60] for l in lessons[:3]
-            ) or "no lessons yet"
+            best_sig = sig_acc[0]['signal'] if sig_acc and sig_acc[0]['total'] >= 3 else "none"
+            worst_sig = sig_acc[-1]['signal'] if sig_acc and sig_acc[-1]['total'] >= 3 else "none"
+
             try:
                 resp = requests.post(
                     "https://api.groq.com/openai/v1/chat/completions",
                     headers={"Authorization": f"Bearer {groq_key}", "Content-Type": "application/json"},
                     json={"model":"llama-3.3-70b-versatile",
                           "messages":[
-                              {"role":"system","content":"You are Marcus Reed, a seasoned options trader. Write a crisp 3-4 sentence strategy note for tomorrow's session. Be specific: which sectors, which DTE, what to watch for."},
+                              {"role":"system","content":"You are Marcus Reed, a seasoned options trader. Write a crisp 3-4 sentence strategy note for tomorrow. Be specific: which sectors, which DTE to focus on, what signals are working, what to avoid."},
                               {"role":"user","content":
-                                  f"EOD debrief. Regime today: {regime.get('regime')} VIX {regime.get('vix',0):.1f}.\\n"
-                                  f"Win rate: {stats['win_rate']:.0f}% | EV: {stats['expectancy']:+.1f}%\\n"
+                                  f"EOD analysis complete.\\n"
+                                  f"TODAY: Closed {len(closed)} trades, Win rate: {stats['win_rate']:.0f}%\\n"
                                   f"DTE performance: {ev_summary}\\n"
-                                  f"Key lessons: {lessons_txt}\\n"
-                                  f"Write tomorrow's trading strategy."}
+                                  f"Best signal: {best_sig} | Worst: {worst_sig}\\n"
+                                  f"Regime tomorrow: {regime.get('regime')} VIX {regime.get('vix',0):.1f}\\n"
+                                  f"Write tomorrow's strategy focusing on best-performing DTE and signals."}
                           ],
-                          "max_tokens":200},
+                          "max_tokens":220},
                     timeout=15
                 )
                 if resp.status_code == 200:
@@ -309,8 +346,12 @@ async def job_eod_review(context):
                         parse_mode="HTML")
             except: pass
 
+        # Summary
         await context.bot.send_message(chat_id,
-            "✅ EOD review complete. Bot will scan again tomorrow at 10:00 AM EST.",
+            f"✅ EOD review complete.\\n"
+            f"📊 All-time: {stats['total_trades']} trades | {stats['win_rate']:.0f}% WR | "
+            f"${stats['total_pnl_dollar']:+.2f} total P&L\\n"
+            f"🔔 Bot will resume scanning tomorrow at 10:00 AM EST.",
             parse_mode="HTML")
 
     except Exception as e:
