@@ -294,3 +294,8 @@ if __name__ == "__main__":
     print("\nSignal Accuracy:")
     for s in get_signal_summary():
         print(f"  {s['signal']:12s}: WR {s['win_rate']:.0f}% ({s['total']} trades)")
+
+# ── Compatibility stub for bot.py ─────────────────────────────────────────────
+def run_pattern_study():
+    """Alias — pattern study merged into run_learning_cycle()."""
+    return run_learning_cycle()
