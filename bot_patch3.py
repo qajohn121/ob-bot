@@ -81,33 +81,49 @@ async def job_morning_scan(context):
         await context.bot.send_message(chat_id, header, parse_mode="HTML")
 
         # ── Top 5 CALLS ─────────────────────────────────────────────────────
-        calls_lines = ["🚀 <b>TOP 5 CALLS</b>\\n"]
+        calls_lines = ["🚀 <b>TOP 5 CALLS — Auto-logged for tracking</b>\\n"]
         for i, p in enumerate(top_c, 1):
             e = p.get("entry_call", {})
             src = "📍" if e.get("price_source") == "market" else "~"
             bid_ask = f" (bid ${e.get('bid',0):.2f}/ask ${e.get('ask',0):.2f})" if e.get("bid") else ""
             calls_lines.append(
-                f"<b>#{i} {p['symbol']}</b>  score={p['call_score']}  ${p['price']:.2f}\\n"
+                f"<b>#{i} {p['symbol']}</b>  score={p['call_score']}/100  ${p['price']:.2f}\\n"
                 f"   Strike ${e.get('strike','?')} exp {e.get('expiry','?')}  "
                 f"{src}${e.get('est_option_price','?')}/contract{bid_ask}\\n"
                 f"   Stop ${e.get('stop_loss_option','?')} → Target ${e.get('target_option','?')}\\n"
                 f"   {p.get('call_reason','')[:80]}"
             )
+            # Auto-log each of top 5 calls
+            if p['call_score'] >= 40:  # lower threshold since top 5 are pre-filtered
+                try:
+                    log_trade(p, "CALL", session="morning_auto", dte_profile="TOP_5_CALLS",
+                              regime=regime.get("regime","NORMAL"), recommendation_source="top_call", recommendation_rank=i)
+                    calls_lines[-1] += "\\n   ✍️ <i>logged #" + str(i) + "</i>"
+                except Exception as le:
+                    log.warning(f"Auto-log top call #{i}: {le}")
         await context.bot.send_message(chat_id, "\\n".join(calls_lines), parse_mode="HTML")
 
         # ── Top 5 PUTS ──────────────────────────────────────────────────────
-        puts_lines = ["💥 <b>TOP 5 PUTS</b>\\n"]
+        puts_lines = ["💥 <b>TOP 5 PUTS — Auto-logged for tracking</b>\\n"]
         for i, p in enumerate(top_p, 1):
             e = p.get("entry_put", {})
             src = "📍" if e.get("price_source") == "market" else "~"
             bid_ask = f" (bid ${e.get('bid',0):.2f}/ask ${e.get('ask',0):.2f})" if e.get("bid") else ""
             puts_lines.append(
-                f"<b>#{i} {p['symbol']}</b>  score={p['put_score']}  ${p['price']:.2f}\\n"
+                f"<b>#{i} {p['symbol']}</b>  score={p['put_score']}/100  ${p['price']:.2f}\\n"
                 f"   Strike ${e.get('strike','?')} exp {e.get('expiry','?')}  "
                 f"{src}${e.get('est_option_price','?')}/contract{bid_ask}\\n"
                 f"   Stop ${e.get('stop_loss_option','?')} → Target ${e.get('target_option','?')}\\n"
                 f"   {p.get('put_reason','')[:80]}"
             )
+            # Auto-log each of top 5 puts
+            if p['put_score'] >= 40:  # lower threshold since top 5 are pre-filtered
+                try:
+                    log_trade(p, "PUT", session="morning_auto", dte_profile="TOP_5_PUTS",
+                              regime=regime.get("regime","NORMAL"), recommendation_source="top_put", recommendation_rank=i)
+                    puts_lines[-1] += "\\n   ✍️ <i>logged #" + str(i) + "</i>"
+                except Exception as le:
+                    log.warning(f"Auto-log top put #{i}: {le}")
         await context.bot.send_message(chat_id, "\\n".join(puts_lines), parse_mode="HTML")
 
         # ── DTE Profile picks (LONG options) ────────────────────────────────
