@@ -5,6 +5,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import yfinance as yf
+from vol_analysis import hv_iv_analysis
 
 # Suppress noisy yfinance/urllib3 HTTP error prints
 for _noisy in ("yfinance","urllib3","peewee","yfinance.utils","yfinance.base"):
@@ -276,10 +277,21 @@ def fetch_ticker_data(symbol):
         sma20 = float(closes.rolling(20).mean().iloc[-1])
         sma50_src = hist_1y["Close"] if not hist_1y.empty and len(hist_1y)>=50 else closes
         sma50 = float(sma50_src.rolling(50).mean().iloc[-1])
+
+        # ── Historical volatility vs implied volatility ────────────────────────
+        # Uses Yang-Zhang estimator on 1y daily data — tells us if options are
+        # cheap, fair, or expensive relative to how much the stock actually moves.
+        hv_src = hist_1y if not hist_1y.empty and len(hist_1y) >= 35 else hist_3mo
+        vol_data = hv_iv_analysis(hv_src, iv, window=30)
+
         return {
             "symbol":symbol,"price":round(price,2),"pct_change":pct_change,
             "move_4h":move_4h,"rel_volume":rel_volume,"avg_volume":int(avg_vol_20),
             "rsi":round(rsi,1),"atr_pct":atr_pct,"iv":round(iv,3),"iv_pct":round(iv*100,1),
+            "hv30":vol_data["hv30_pct"],
+            "iv_hv_ratio":vol_data["iv_hv_ratio"],
+            "iv_signal":vol_data["signal"],
+            "iv_signal_desc":vol_data["description"],
             "pct_from_52w_high":pct_from_high,"pct_from_52w_low":pct_from_low,
             "high_52w":round(high_52w,2),"low_52w":round(low_52w,2),
             "above_sma20":price>sma20,"above_sma50":price>sma50,
@@ -314,8 +326,18 @@ def score_for_call(d, w=None):
     if 1<=dte<=5: score+=10; reasons.append(f"⚡ Earnings {dte}d")
     elif 6<=dte<=14: score+=5; reasons.append(f"Earnings {dte}d")
     if d["is_war_sector"] and mv>0: score+=int(10*w.get("sector_weight",1)); reasons.append("🎯 War sector")
-    if d["iv_pct"]>50: score+=5; reasons.append(f"IV {d['iv_pct']:.0f}%")
-    return min(100,score), " | ".join(reasons[:3]) if reasons else "Mixed signals"
+    # IV/HV ratio — are we buying cheap or expensive options?
+    iv_hv = d.get("iv_hv_ratio")
+    iv_sig = d.get("iv_signal", "UNKNOWN")
+    if iv_hv is not None:
+        if   iv_sig == "CHEAP"     and iv_hv < 0.75: score += 15; reasons.append(f"IV cheap vs HV ({iv_hv:.2f}x) ✅")
+        elif iv_sig == "CHEAP":                       score += 10; reasons.append(f"IV underpriced ({iv_hv:.2f}x HV)")
+        elif iv_sig == "FAIR":                        score +=  3
+        elif iv_sig == "RICH":                        score -=  8; reasons.append(f"IV pricey ({iv_hv:.2f}x HV) ⚠️")
+        elif iv_sig == "VERY_RICH":                   score -= 18; reasons.append(f"IV very expensive ({iv_hv:.2f}x HV) ❌")
+    else:
+        if d["iv_pct"] > 50: score += 5; reasons.append(f"IV {d['iv_pct']:.0f}%")
+    return min(100, max(0, score)), " | ".join(reasons[:3]) if reasons else "Mixed signals"
 
 def score_for_put(d, w=None):
     w=w or {}; score=0; reasons=[]
@@ -341,8 +363,18 @@ def score_for_put(d, w=None):
     dte=d["days_to_earnings"]
     if 1<=dte<=5 and mv<-2: score+=10; reasons.append(f"⚡ Earnings {dte}d falling")
     elif 6<=dte<=14 and mv<0: score+=5
-    if d["iv_pct"]>60: score+=5; reasons.append(f"IV {d['iv_pct']:.0f}%")
-    return min(100,score), " | ".join(reasons[:3]) if reasons else "Bearish signals"
+    # IV/HV ratio — buying puts is still buying premium; want cheap IV
+    iv_hv = d.get("iv_hv_ratio")
+    iv_sig = d.get("iv_signal", "UNKNOWN")
+    if iv_hv is not None:
+        if   iv_sig == "CHEAP"     and iv_hv < 0.75: score += 15; reasons.append(f"IV cheap vs HV ({iv_hv:.2f}x) ✅")
+        elif iv_sig == "CHEAP":                       score += 10; reasons.append(f"IV underpriced ({iv_hv:.2f}x HV)")
+        elif iv_sig == "FAIR":                        score +=  3
+        elif iv_sig == "RICH":                        score -=  8; reasons.append(f"IV pricey ({iv_hv:.2f}x HV) ⚠️")
+        elif iv_sig == "VERY_RICH":                   score -= 18; reasons.append(f"IV very expensive ({iv_hv:.2f}x HV) ❌")
+    else:
+        if d["iv_pct"] > 60: score += 5; reasons.append(f"IV {d['iv_pct']:.0f}%")
+    return min(100, max(0, score)), " | ".join(reasons[:3]) if reasons else "Bearish signals"
 
 # ── Minimum score thresholds — never show a trade below these ─────────────────
 MIN_SCORE = {"0DTE": 65, "7DTE": 55, "21DTE": 50, "30DTE": 45, "60DTE": 40}

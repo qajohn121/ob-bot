@@ -106,9 +106,17 @@ def format_scan_result(pick, regime_info, tier, rank=1):
             max_tokens=60, temperature=0.3
         )
 
+    hv30      = pick.get("hv30")
+    iv_hv     = pick.get("iv_hv_ratio")
+    iv_sig    = pick.get("iv_signal", "UNKNOWN")
+    iv_sig_icons = {"CHEAP": "✅", "FAIR": "➡️", "RICH": "⚠️", "VERY_RICH": "❌", "UNKNOWN": ""}
+    iv_line = (f"IV:{iv:.0f}%  HV:{hv30:.0f}%  Ratio:{iv_hv:.2f}x {iv_sig_icons.get(iv_sig,'')}"
+               if hv30 and iv_hv else f"IV:{iv:.0f}%")
+
     lines = [
         f"{em} <b>{tier} — {symbol} [{direction}]</b>  {cv_icon} {score}/100",
-        f"${price:.2f}  4h:{move:+.1f}%  Vol:{vol:.1f}x  RSI:{rsi:.0f}  IV:{iv:.0f}%",
+        f"${price:.2f}  4h:{move:+.1f}%  Vol:{vol:.1f}x  RSI:{rsi:.0f}",
+        f"{iv_line}",
         f"Regime: <b>{regime}</b>",
         "─────────────────",
         f"📋 <b>Buy {direction} ${strike}</b> exp {expiry} ({dte_val}DTE)",
