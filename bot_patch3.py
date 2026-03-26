@@ -350,7 +350,7 @@ async def job_eod_review(context):
             "🌆 <b>EOD REVIEW — 3:30 PM EST</b>\\nRunning comprehensive end-of-day analysis...",
             parse_mode="HTML")
 
-        from paper_trader import check_open_trades, get_performance_stats, get_lessons
+        from paper_trader import check_open_trades, get_performance_stats, get_lessons, get_performance_by_recommendation_source
         from learner import run_learning_cycle, get_ev_by_dte, get_signal_summary
         from scanner import get_market_regime
         import requests, os
@@ -366,6 +366,7 @@ async def job_eod_review(context):
         lessons  = get_lessons(10)
         dte_ev   = get_ev_by_dte()
         sig_acc  = get_signal_summary()
+        rec_perf = get_performance_by_recommendation_source()  # Performance by rec type
 
         # ────────────────────────────────────────────────────────────────────────
         # ── TODAY'S TRADE RESULTS (detailed) ──────────────────────────────────
@@ -411,6 +412,25 @@ async def job_eod_review(context):
             sig_lines.append("  Not enough data yet (need 3+ trades per signal).")
 
         await context.bot.send_message(chat_id, "\\n".join(sig_lines), parse_mode="HTML")
+
+        # ────────────────────────────────────────────────────────────────────────
+        # ── RECOMMENDATION SOURCE PERFORMANCE ─────────────────────────────────
+        if rec_perf:
+            rec_lines = ["🎯 <b>WHICH RECOMMENDATION TYPE WORKS BEST?</b>\\n"]
+            rec_names = {"top_call": "🚀 Top 5 Calls", "top_put": "💥 Top 5 Puts",
+                        "dte_pick": "🎯 DTE Picks", "dte_spread": "📐 Spreads"}
+
+            # Sort by EV descending
+            sorted_rec = sorted(rec_perf.items(), key=lambda x: x[1]["ev"], reverse=True)
+            for src, stats in sorted_rec:
+                if stats["trades"] >= 2:  # Only show if 2+ trades
+                    trend = "🏆" if stats["ev"] > 0 else "⚠️"
+                    rec_lines.append(
+                        f"  {trend} <b>{rec_names.get(src, src)}</b>: {stats['trades']} trades | "
+                        f"WR {stats['win_rate']:.0f}% | Avg {stats['avg_pnl']:+.1f}% | EV {stats['ev']:+.1f}%"
+                    )
+
+            await context.bot.send_message(chat_id, "\\n".join(rec_lines), parse_mode="HTML")
 
         # ────────────────────────────────────────────────────────────────────────
         # ── LEARNING CYCLE ADJUSTMENTS ───────────────────────────────────────

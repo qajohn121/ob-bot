@@ -347,6 +347,48 @@ def get_performance_stats():
         "recent_trades":closed[:10],"open_positions":open_list,
     }
 
+def get_performance_by_recommendation_source():
+    """Get win rate and EV breakdown by recommendation source (top_call, top_put, dte_pick, etc)."""
+    try:
+        conn = _conn()
+        rows = [dict(r) for r in conn.execute(
+            "SELECT recommendation_source, status, pnl_pct, recommendation_rank FROM trades "
+            "WHERE status IN ('WIN','LOSS') AND recommendation_source IS NOT NULL"
+        ).fetchall()]
+        conn.close()
+
+        sources = {}
+        for r in rows:
+            src = r["recommendation_source"]
+            if src not in sources:
+                sources[src] = {"wins": 0, "losses": 0, "pnl": []}
+            if r["status"] == "WIN":
+                sources[src]["wins"] += 1
+            else:
+                sources[src]["losses"] += 1
+            pnl = r["pnl_pct"] or 0
+            sources[src]["pnl"].append(pnl)
+
+        result = {}
+        for src, data in sources.items():
+            total = data["wins"] + data["losses"]
+            wr = round(data["wins"] / max(total, 1) * 100, 1)
+            pnl_list = data["pnl"]
+            avg_pnl = round(sum(pnl_list) / len(pnl_list), 1) if pnl_list else 0
+            wp = [x for x in pnl_list if x > 0]
+            lp = [x for x in pnl_list if x <= 0]
+            aw = round(sum(wp) / len(wp), 1) if wp else 0
+            al = round(sum(lp) / len(lp), 1) if lp else 0
+            ev = round((wr / 100 * aw) + ((1 - wr / 100) * al), 1)
+            result[src] = {
+                "trades": total, "wins": data["wins"], "losses": data["losses"],
+                "win_rate": wr, "avg_pnl": avg_pnl, "avg_win": aw, "avg_loss": al, "ev": ev
+            }
+        return result
+    except Exception as e:
+        log.error(f"get_performance_by_recommendation_source: {e}")
+        return {}
+
 def get_todays_trades():
     """Get all trades created TODAY, regardless of status (OPEN, WIN, LOSS)."""
     from datetime import datetime, timedelta
