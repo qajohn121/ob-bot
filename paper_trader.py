@@ -419,13 +419,23 @@ def check_open_trades(regime="NORMAL"):
                 pnl_dollar= pnl_pct
             days_held = (datetime.now()-datetime.fromisoformat(t["created_at"])).days
             expired   = exp_str and datetime.strptime(exp_str,"%Y-%m-%d").date()<datetime.now().date()
-            # DTE-profile specific stop rules
+            # DTE-profile specific rules: realistic profit targets + stop losses
             dte_profile = t.get("dte_profile","30DTE") or "30DTE"
-            stop_pct = {"0DTE":-25,"7DTE":-40,"21DTE":-50,"30DTE":-50,"60DTE":-60}.get(dte_profile,-50)
+
+            # Profit targets (realistic for options decay)
+            profit_target = {"0DTE": 50, "7DTE": 40, "21DTE": 35, "30DTE": 30, "60DTE": 25}.get(dte_profile, 30)
+            stop_pct = {"0DTE": -25, "7DTE": -40, "21DTE": -50, "30DTE": -50, "60DTE": -60}.get(dte_profile, -50)
+
+            # Iron Condor specific: close at 50% of max profit instead of dollar-based target
+            spread_type = t.get("spread_type", "")
+            if spread_type == "IRON CONDOR":
+                max_loss = t.get("credit_received", 100)  # Max profit = credit received
+                profit_target = max_loss * 0.50 / max_loss * 100 if max_loss > 0 else 50
+
             should_close=False; outcome="OPEN"; reason=""
             if expired:                    should_close=True; outcome="WIN" if pnl_pct>0 else "LOSS"; reason="Expired"
-            elif pnl_pct>=80:              should_close=True; outcome="WIN";  reason=f"TP +{pnl_pct:.0f}%"
-            elif pnl_pct<=stop_pct:        should_close=True; outcome="LOSS"; reason=f"SL {pnl_pct:.0f}%"
+            elif pnl_pct >= profit_target: should_close=True; outcome="WIN";  reason=f"TP +{pnl_pct:.0f}% (target: {profit_target}%)"
+            elif pnl_pct <= stop_pct:      should_close=True; outcome="LOSS"; reason=f"SL {pnl_pct:.0f}%"
             elif dte_profile=="0DTE" and days_held>=1: should_close=True; outcome="WIN" if pnl_pct>0 else "LOSS"; reason="0DTE expired"
             if should_close:
                 conn3=_conn(); conn3.execute(

@@ -39,23 +39,15 @@ for _noisy in ("yfinance","urllib3","peewee","yfinance.utils","yfinance.base"):
 log = logging.getLogger("ob.scanner")
 
 SCAN_TICKERS = [
-    # Mega-cap tech (liquid, high options volume)
-    "AAPL","MSFT","NVDA","GOOGL","META","AMZN","TSLA","AMD","AVGO","CRM",
-    "ORCL","INTC","QCOM","MU","ADBE","NFLX","NET","SHOP",
-    # Financials / Consumer / Industrial
-    "JPM","GS","BAC","MS","V","MA","UNH","JNJ","PFE","MRK",
-    "XOM","CVX","BA","CAT","GE","HD","WMT","COST","DIS","SBUX",
-    # ETFs (liquid options, no fundamentals)
-    "SPY","QQQ","IWM","GLD","TLT","XLF","XLE","XLK","SOXL",
-    # High-beta / speculative
-    "COIN","HOOD","MSTR","SOFI","RIVN","PLTR","RBLX","SNAP","UBER",
-    "ROKU","DKNG","WYNN","MGM",
-    # Defense / Energy
-    "LMT","RTX","NOC","GD","OXY","DVN","SLB","HAL",
-    # Biotech (legit options volume only)
-    "MRNA","BNTX","SRPT","ARWR","VKTX",
-    # Meme / crypto-adjacent
-    "GME","AMC","MARA","RIOT",
+    # TIER 1: Mega-cap tech — institutional liquidity, tight spreads, high IV
+    "AAPL","MSFT","NVDA","GOOGL","META","AMZN",
+    # TIER 2: Quality financials — steady premium, low-slippage
+    "JPM","V","MA","UNH",
+    # TIER 3: Sector leaders — institutional options volume
+    "TSLA","CRM","AVGO",
+    # TIER 4: Broad market ETFs — liquid, institutional-grade
+    "SPY","QQQ",
+    # TOTAL: 15 stocks (focused, high-quality, liquid for spreads)
 ]
 
 WAR_TICKERS   = {"LMT","RTX","NOC","GD","HII","BAH","CACI","SAIC","XOM","CVX","COP","OXY","SLB","HAL","BKR","USO","GLD","NEM","WPM","GE"}
@@ -757,7 +749,7 @@ def score_for_put(d, w=None, sentiment=None):
     return min(100, max(0, score)), " | ".join(reasons[:3]) if reasons else "Bearish signals"
 
 # ── Minimum score thresholds — never show a trade below these ─────────────────
-MIN_SCORE = {"0DTE": 70, "7DTE": 62, "21DTE": 58, "30DTE": 55, "60DTE": 50}
+MIN_SCORE = {"0DTE": 75, "7DTE": 70, "21DTE": 68, "30DTE": 65, "60DTE": 60}
 
 # ── Minimum conviction gap — prevents ambiguous signals ─────────────────────
 # A signal is meaningless when call_score ≈ put_score. Require sufficient directional confidence.
