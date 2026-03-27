@@ -61,15 +61,26 @@ async def job_morning_scan(context):
             parse_mode="HTML")
 
         from scanner import run_scan_dte_profiles
-        from paper_trader import init_db, log_trade
-        from grok_brain import generate_ob_commentary, format_scan_result
+        from paper_trader import init_db, log_trade, log_iron_condor
+        from grok_brain import generate_ob_commentary, format_scan_result, format_iron_condor
 
         r      = run_scan_dte_profiles()
         regime = r["regime"]
         picks  = r["dte_picks"]
         top_c  = r["top_calls"][:5]
         top_p  = r["top_puts"][:5]
+        rec_confidence = r.get("rec_confidence", {})  # Get confidence scores from scan
         init_db()
+
+        # Apply confidence multiplier to top calls/puts before logging
+        top_call_conf = rec_confidence.get("top_call", {}).get("confidence", 50) / 100.0
+        top_put_conf = rec_confidence.get("top_put", {}).get("confidence", 50) / 100.0
+        if top_call_conf < 1.0:
+            for p in top_c:
+                p["call_score"] = max(0, round(p["call_score"] * top_call_conf))
+        if top_put_conf < 1.0:
+            for p in top_p:
+                p["put_score"] = max(0, round(p["put_score"] * top_put_conf))
 
         # ── Regime header ───────────────────────────────────────────────────
         commentary = generate_ob_commentary(top_c, top_p, regime)
@@ -151,6 +162,25 @@ async def job_morning_scan(context):
                     dte_lines[-1] += "     ✍️ <i>logged naked</i>\\n"
                 except Exception as le:
                     log.warning(f"Auto-log {tier}: {le}")
+
+            # Also show IRON CONDOR as alternative (if 40-65 score = medium confidence)
+            ic = p.get("iron_condor")
+            ic_available = p.get("ic_available", False)
+            if ic and ic_available and 40 <= sc <= 65:
+                ic_credit = ic.get("total_credit", 0)
+                ic_max_loss = ic.get("max_loss", 0)
+                dte_lines.append(
+                    f"  <b>ALT — {tier} IRON CONDOR:</b> {p['symbol']} (POP ~80-85%)\\n"
+                    f"     📍 Profit Zone: {ic.get('profit_zone', 'N/A')}\\n"
+                    f"     Credit ${ic_credit:.2f}/share | Max Loss ${ic_max_loss:.2f} | TP50% ${ic.get('take_profit_50','?')}\\n"
+                )
+                # Log the iron condor for tracking
+                try:
+                    log_iron_condor(p, ic, session="morning_auto", dte_profile=tier,
+                                  regime=regime.get("regime","NORMAL"), recommendation_rank=1)
+                    dte_lines[-1] += "     ✍️ <i>logged iron condor</i>\\n"
+                except Exception as le:
+                    log.warning(f"Auto-log IC {tier}: {le}")
 
             # Also show credit spread as alternative (if score >= 50)
             sp = p.get("spread")
@@ -350,7 +380,7 @@ async def job_eod_review(context):
             "🌆 <b>EOD REVIEW — 3:30 PM EST</b>\\nRunning comprehensive end-of-day analysis...",
             parse_mode="HTML")
 
-        from paper_trader import check_open_trades, get_performance_stats, get_lessons, get_performance_by_recommendation_source
+        from paper_trader import check_open_trades, get_performance_stats, get_lessons, get_performance_by_recommendation_source, get_recommendation_confidence, get_confidence_change_today
         from learner import run_learning_cycle, get_ev_by_dte, get_signal_summary
         from scanner import get_market_regime
         import requests, os
@@ -431,6 +461,44 @@ async def job_eod_review(context):
                     )
 
             await context.bot.send_message(chat_id, "\\n".join(rec_lines), parse_mode="HTML")
+
+        # ────────────────────────────────────────────────────────────────────────
+        # ── RECOMMENDATION SOURCE CONFIDENCE (Reward/Punishment) ──────────────
+        rec_conf = get_recommendation_confidence()
+        conf_lines = ["🧬 <b>RECOMMENDATION SOURCE CONFIDENCE (Self-Learning)</b>\\n"]
+        conf_lines.append("The bot rewards winning recommendation types and punishes losers.\\n")
+
+        for src in ["top_call", "top_put", "dte_pick", "dte_spread"]:
+            if src in rec_conf:
+                conf_data = rec_conf[src]
+                current_conf = conf_data.get("confidence", 50)
+                today_change = get_confidence_change_today(src)
+                change = today_change.get("change", 0)
+                today_summary = today_change.get("summary", "No trades")
+
+                # Show confidence with change indicator
+                if change > 0:
+                    change_icon = "📈"
+                    status = "REWARDED"
+                elif change < 0:
+                    change_icon = "📉"
+                    status = "PUNISHED"
+                else:
+                    change_icon = "➡️"
+                    status = "NEUTRAL"
+
+                src_names = {"top_call": "🚀 Top 5 Calls", "top_put": "💥 Top 5 Puts",
+                            "dte_pick": "🎯 DTE Picks", "dte_spread": "📐 Spreads"}
+
+                conf_lines.append(
+                    f"  {change_icon} <b>{src_names.get(src, src)}</b>: "
+                    f"Confidence {current_conf}% | Today: {status} ({today_summary})"
+                )
+
+        conf_lines.append("\\n💡 <b>How it works:</b> Winning trades (+reward) boost confidence. "
+                         "Losing trades (-punishment) reduce it. Low-confidence sources get lower recommendation scores tomorrow.")
+
+        await context.bot.send_message(chat_id, "\\n".join(conf_lines), parse_mode="HTML")
 
         # ────────────────────────────────────────────────────────────────────────
         # ── LEARNING CYCLE ADJUSTMENTS ───────────────────────────────────────

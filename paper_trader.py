@@ -42,6 +42,21 @@ CREATE TABLE IF NOT EXISTS autopsy (
     lesson TEXT, failed_signal TEXT, regime TEXT DEFAULT 'NORMAL',
     FOREIGN KEY(trade_id) REFERENCES trades(id)
 );
+CREATE TABLE IF NOT EXISTS recommendation_confidence (
+    recommendation_source TEXT PRIMARY KEY,
+    confidence INTEGER DEFAULT 50,
+    reward_count INTEGER DEFAULT 0,
+    punishment_count INTEGER DEFAULT 0,
+    last_updated TEXT,
+    last_reward_date TEXT,
+    last_punishment_date TEXT
+);
+CREATE TABLE IF NOT EXISTS iv_history (
+    symbol TEXT NOT NULL,
+    iv_value REAL NOT NULL,
+    recorded_at TEXT NOT NULL,
+    PRIMARY KEY (symbol, recorded_at)
+);
 """
 
 MIGRATIONS = [
@@ -57,6 +72,16 @@ MIGRATIONS = [
     "ALTER TABLE trades ADD COLUMN recommendation_rank INTEGER DEFAULT 0",
 ]
 
+# Reward/Punishment system: confidence scores per recommendation source
+_INITIAL_CONFIDENCE = {
+    "top_call": 50,
+    "top_put": 50,
+    "dte_pick": 50,
+    "dte_spread": 50,
+    "ic_pick": 50,      # Iron Condor picks (medium-confidence setups)
+    "manual": 50,
+}
+
 def init_db():
     conn = sqlite3.connect(str(DB_PATH))
     conn.executescript(SCHEMA)
@@ -66,6 +91,8 @@ def init_db():
         except: pass
     conn.commit(); conn.close()
     log.info(f"DB ready at {DB_PATH}")
+    # Initialize recommendation confidence if empty
+    _init_confidence()
 
 def _conn():
     c = sqlite3.connect(str(DB_PATH)); c.row_factory = sqlite3.Row; return c
@@ -124,7 +151,113 @@ def log_trade(d, direction, sentiment=None, session="morning", dte_profile="30DT
          is_spread,short_strike,long_strike,credit_received,spread_type,recommendation_source,recommendation_rank))
     tid=c.lastrowid; conn.commit(); conn.close()
     trade_type = f"{spread_type} spread" if is_spread else f"{direction} option"
-    log.info(f"Logged #{tid}: {d.get('symbol')} {trade_type} ({recommendation_source}#{recommendation_rank}) {dte_profile}"); return tid
+    log.info(f"Logged #{tid}: {d.get('symbol')} {trade_type} ({recommendation_source}#{recommendation_rank}) {dte_profile}")
+
+    # Send Telegram entry alert (async, non-blocking)
+    try:
+        from trade_alerts import send_trade_alert
+        import asyncio
+        # Prepare alert data
+        alert_data = {
+            "strategy": spread_type if is_spread else direction,
+            "entry_price": round(price, 2),
+            "strike": round(strike, 2),
+            "expiry": expiry,
+            "credit": round(credit_received, 2) if is_spread else None,
+            "reason": reason,
+            "iv_rank": d.get("ivr"),
+            "pre_market_gap": d.get("premarket_gap_pct"),
+        }
+        if is_spread:
+            alert_data["profit_zone_low"] = short_strike
+            alert_data["profit_zone_high"] = long_strike
+            alert_data["max_loss"] = spread_data.get("max_loss", 0)
+            alert_data["pop"] = spread_data.get("pop", "~80-85%")
+        else:
+            alert_data["target"] = d.get("move_4h", 0) * price if d.get("move_4h") else None
+            alert_data["stop"] = price * 0.95  # Simple 5% stop
+
+        # Send alert asynchronously
+        asyncio.run(send_trade_alert("ENTRY", d.get("symbol", ""), **alert_data))
+    except Exception as e:
+        log.debug(f"Trade alert send error: {e}")
+
+    return tid
+
+def log_iron_condor(d, ic_data, session="morning", dte_profile="30DTE", regime="NORMAL", recommendation_source="ic_pick", recommendation_rank=0):
+    """
+    Log an Iron Condor trade (two spreads combined: call spread + put spread).
+    IC data contains both spreads' information.
+    """
+    price = d.get("price", 100)
+    iv = d.get("iv", 0.30)
+    symbol = d.get("symbol", "")
+    call_score = d.get("call_score", 50)
+    put_score = d.get("put_score", 50)
+    avg_score = round((call_score + put_score) / 2)
+
+    # IC expiry from dte_profile mapping
+    expiry_map = {
+        "0DTE": _today_expiry(),
+        "7DTE": (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d"),
+        "21DTE": (datetime.now() + timedelta(days=21)).strftime("%Y-%m-%d"),
+        "30DTE": _next_expiry(),
+        "60DTE": (datetime.now() + timedelta(days=60)).strftime("%Y-%m-%d"),
+    }
+    expiry = expiry_map.get(dte_profile, _next_expiry())
+
+    # IC-specific fields
+    total_credit = ic_data.get("total_credit", 0)
+    max_loss = ic_data.get("max_loss", 0)
+    call_short_strike = ic_data.get("call_short_strike", 0)
+    call_long_strike = ic_data.get("call_long_strike", 0)
+    put_short_strike = ic_data.get("put_short_strike", 0)
+    put_long_strike = ic_data.get("put_long_strike", 0)
+
+    # Store IC as special "IC" direction with comprehensive strike info in spread fields
+    conn = _conn()
+    c = conn.cursor()
+    c.execute(
+        """INSERT INTO trades (created_at,symbol,direction,entry_price,entry_option_price,
+           strike,expiry,call_score,put_score,direction_score,sentiment_score,reason,entry_greeks,
+           rel_volume,pct_change_4h,rsi,iv_pct,war_catalyst,bankruptcy_flag,status,scan_session,
+           max_price,min_price,dte_profile,regime,predicted_move,is_spread,short_strike,long_strike,
+           credit_received,spread_type,recommendation_source,recommendation_rank)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (datetime.now().isoformat(), symbol, "IC", price, total_credit,
+         call_short_strike, expiry, call_score, put_score, avg_score,
+         50.0, f"Iron Condor: CS {call_short_strike}/{call_long_strike} | PS {put_short_strike}/{put_long_strike}", "{}",
+         d.get("rel_volume", 1.0), d.get("move_4h", 0), d.get("rsi", 50), d.get("iv_pct", 30),
+         0, 0, "OPEN", session, price, price, dte_profile, regime, d.get("move_4h", 0),
+         1, put_short_strike, put_long_strike, total_credit, "IRON CONDOR", recommendation_source, recommendation_rank)
+    )
+    tid = c.lastrowid
+    conn.commit()
+    conn.close()
+    log.info(f"Logged #{tid}: {symbol} IRON CONDOR ({recommendation_source}#{recommendation_rank}) {dte_profile} | Credit: ${total_credit:.2f} Max Loss: ${max_loss:.2f}")
+
+    # Send Telegram entry alert for Iron Condor (async, non-blocking)
+    try:
+        from trade_alerts import send_trade_alert
+        import asyncio
+        asyncio.run(send_trade_alert(
+            "ENTRY",
+            symbol,
+            strategy="IRON_CONDOR",
+            entry_price=round(price, 2),
+            credit=round(total_credit, 2),
+            profit_zone_low=put_short_strike,
+            profit_zone_high=call_short_strike,
+            max_loss=round(max_loss, 2),
+            pop=ic_data.get("pop", "~80-85%"),
+            iv_rank=d.get("ivr"),
+            pre_market_gap=d.get("premarket_gap_pct"),
+            reason=f"Iron Condor: CS {call_short_strike}/{call_long_strike} | PS {put_short_strike}/{put_long_strike}"
+        ))
+    except Exception as e:
+        log.debug(f"IC entry alert send error: {e}")
+
+    return tid
 
 # ── Autopsy: rule-based analysis of why a trade won or lost ──────────────────
 def _generate_autopsy_lesson(trade, pnl_pct, cur_price, cur_iv_pct):
@@ -300,10 +433,30 @@ def check_open_trades(regime="NORMAL"):
                     (outcome,round(cur,2),round(cur_opt,3),pnl_pct,pnl_dollar,reason,datetime.now().isoformat(),days_held,t["id"]))
                 conn3.commit(); conn3.close()
                 write_autopsy(t["id"], pnl_pct, cur, outcome, regime)
+                # Update recommendation source confidence
+                rec_source = t.get("recommendation_source") or "manual"
+                update_recommendation_confidence(rec_source, outcome, pnl_pct)
                 closed.append({"id":t["id"],"symbol":t["symbol"],"direction":t["direction"],
                                 "dte_profile":dte_profile,"pnl_pct":pnl_pct,"pnl_dollar":pnl_dollar,
                                 "outcome":outcome,"reason":reason})
                 log.info(f"Closed #{t['id']} {t['symbol']} {t['direction']} {dte_profile}: {outcome} {pnl_pct:.1f}%")
+
+                # Send Telegram exit alert (async, non-blocking)
+                try:
+                    from trade_alerts import send_trade_alert
+                    import asyncio
+                    asyncio.run(send_trade_alert(
+                        "EXIT",
+                        t["symbol"],
+                        exit_type=outcome,
+                        exit_price=round(cur, 2),
+                        pnl_pct=pnl_pct,
+                        pnl_dollars=pnl_dollar,
+                        days_held=days_held,
+                        reason=reason
+                    ))
+                except Exception as e:
+                    log.debug(f"Exit alert send error: {e}")
         except Exception as e: log.error(f"check #{t['id']}: {e}")
     return closed
 
@@ -428,6 +581,209 @@ def get_open_trades_with_pnl():
         result.append(item)
     return result
 
+# ── Reward/Punishment System ───────────────────────────────────────────────────
+def _init_confidence():
+    """Initialize confidence table with default values for each recommendation source."""
+    conn = _conn()
+    for source, initial_conf in _INITIAL_CONFIDENCE.items():
+        try:
+            conn.execute(
+                "INSERT OR IGNORE INTO recommendation_confidence (recommendation_source, confidence, reward_count, punishment_count, last_updated) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (source, initial_conf, 0, 0, datetime.now().isoformat())
+            )
+        except: pass
+    conn.commit(); conn.close()
+
+def get_recommendation_confidence():
+    """Return confidence scores for all recommendation sources."""
+    _init_confidence()  # Ensure table is initialized
+    try:
+        conn = _conn()
+        rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM recommendation_confidence ORDER BY recommendation_source"
+        ).fetchall()]
+        conn.close()
+        result = {}
+        for r in rows:
+            result[r["recommendation_source"]] = {
+                "confidence": r["confidence"],
+                "reward_count": r["reward_count"],
+                "punishment_count": r["punishment_count"],
+                "last_updated": r["last_updated"],
+            }
+        # Ensure all sources are present with defaults
+        for source in _INITIAL_CONFIDENCE:
+            if source not in result:
+                result[source] = {"confidence": 50, "reward_count": 0, "punishment_count": 0, "last_updated": ""}
+        return result
+    except Exception as e:
+        log.error(f"get_recommendation_confidence: {e}")
+        return {s: {"confidence": 50, "reward_count": 0, "punishment_count": 0, "last_updated": ""}
+                for s in _INITIAL_CONFIDENCE}
+
+def update_recommendation_confidence(source, outcome, pnl_pct):
+    """
+    Update confidence for a recommendation source based on trade outcome.
+    Reward winners more than we punish losers to encourage trying new strategies.
+    """
+    if source not in _INITIAL_CONFIDENCE:
+        return
+
+    pnl_pct = pnl_pct or 0
+    try:
+        conn = _conn()
+        current = conn.execute(
+            "SELECT confidence, reward_count, punishment_count FROM recommendation_confidence WHERE recommendation_source=?",
+            (source,)
+        ).fetchone()
+
+        if not current:
+            _init_confidence()
+            current = conn.execute(
+                "SELECT confidence, reward_count, punishment_count FROM recommendation_confidence WHERE recommendation_source=?",
+                (source,)
+            ).fetchone()
+
+        conf = current["confidence"]
+        rewards = current["reward_count"]
+        punishments = current["punishment_count"]
+
+        if outcome == "WIN":
+            # Scale reward by profitability
+            if pnl_pct > 50:
+                delta = 5
+            elif pnl_pct > 30:
+                delta = 4
+            elif pnl_pct > 10:
+                delta = 3
+            else:  # 0-10% win
+                delta = 1
+            conf = min(100, conf + delta)
+            rewards += 1
+            last_date_field = "last_reward_date"
+        else:  # LOSS
+            # Scale punishment by loss magnitude
+            if pnl_pct < -50:
+                delta = -10
+            elif pnl_pct < -30:
+                delta = -8
+            elif pnl_pct < -10:
+                delta = -5
+            else:  # -10 to 0% loss
+                delta = -2
+            conf = max(0, conf + delta)
+            punishments += 1
+            last_date_field = "last_punishment_date"
+
+        conn.execute(
+            "UPDATE recommendation_confidence SET confidence=?, reward_count=?, punishment_count=?, last_updated=?, "+last_date_field+"=? "
+            "WHERE recommendation_source=?",
+            (conf, rewards, punishments, datetime.now().isoformat(), datetime.now().isoformat(), source)
+        )
+        conn.commit(); conn.close()
+        log.info(f"Updated {source} confidence: {current['confidence']}→{conf} ({outcome} {pnl_pct:+.1f}%)")
+    except Exception as e:
+        log.error(f"update_recommendation_confidence {source}: {e}")
+
+def get_confidence_change_today(source):
+    """Return the confidence change for a source TODAY (for EOD report)."""
+    try:
+        conn = _conn()
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        # Count today's wins and losses for this source
+        closed_today = [dict(r) for r in conn.execute(
+            "SELECT outcome, pnl_pct FROM trades WHERE DATE(closed_at)=? AND recommendation_source=? AND status IN ('WIN','LOSS')",
+            (today_str, source)
+        ).fetchall()]
+        conn.close()
+
+        if not closed_today:
+            return {"change": 0, "wins": 0, "losses": 0, "summary": "No trades closed yet"}
+
+        wins = sum(1 for t in closed_today if t["outcome"] == "WIN")
+        losses = sum(1 for t in closed_today if t["outcome"] == "LOSS")
+
+        # Calculate what the change would have been
+        change = 0
+        for t in closed_today:
+            pnl = t["pnl_pct"] or 0
+            if t["outcome"] == "WIN":
+                if pnl > 50:
+                    change += 5
+                elif pnl > 30:
+                    change += 4
+                elif pnl > 10:
+                    change += 3
+                else:
+                    change += 1
+            else:
+                if pnl < -50:
+                    change -= 10
+                elif pnl < -30:
+                    change -= 8
+                elif pnl < -10:
+                    change -= 5
+                else:
+                    change -= 2
+
+        summary = f"{wins}W/{losses}L (change {change:+d})"
+        return {"change": change, "wins": wins, "losses": losses, "summary": summary}
+    except Exception as e:
+        log.error(f"get_confidence_change_today {source}: {e}")
+        return {"change": 0, "wins": 0, "losses": 0, "summary": "Error"}
+
+# ── IV Rank (IVR) System ───────────────────────────────────────────────────
+def store_iv_snapshot(symbol, iv_value):
+    """Store IV snapshot for a ticker. Keep rolling 365-day window."""
+    try:
+        conn = _conn()
+        c = conn.cursor()
+        now = datetime.now().isoformat()
+        c.execute("INSERT INTO iv_history (symbol, iv_value, recorded_at) VALUES (?, ?, ?)",
+                  (symbol, iv_value, now))
+        # Purge rows older than 365 days
+        cutoff = (datetime.now() - timedelta(days=365)).isoformat()
+        c.execute("DELETE FROM iv_history WHERE symbol=? AND recorded_at<?", (symbol, cutoff))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log.debug(f"store_iv_snapshot {symbol}: {e}")
+
+def get_iv_rank(symbol, current_iv):
+    """
+    Compute IV Rank: where current IV stands in symbol's 52-week range.
+    IVR = (current_IV - min_IV) / (max_IV - min_IV) * 100
+    Returns dict with 'ivr' (0-100), 'days_history', and 'signal' ('HIGH'/'NORMAL'/'LOW').
+    """
+    try:
+        conn = _conn()
+        rows = conn.execute(
+            "SELECT iv_value FROM iv_history WHERE symbol=? AND recorded_at >= datetime('now', '-365 days') ORDER BY recorded_at ASC",
+            (symbol,)
+        ).fetchall()
+        conn.close()
+
+        if not rows or len(rows) < 10:
+            return {"ivr": None, "days_history": len(rows), "signal": "INSUFFICIENT_HISTORY"}
+
+        iv_values = [r[0] for r in rows]
+        min_iv = min(iv_values)
+        max_iv = max(iv_values)
+
+        if max_iv == min_iv:
+            ivr = 50.0
+        else:
+            ivr = round(((current_iv - min_iv) / (max_iv - min_iv)) * 100, 1)
+            ivr = max(0, min(100, ivr))
+
+        # Map to signal
+        signal = "HIGH" if ivr > 60 else ("LOW" if ivr < 30 else "NORMAL")
+        return {"ivr": ivr, "days_history": len(rows), "signal": signal}
+    except Exception as e:
+        log.debug(f"get_iv_rank {symbol}: {e}")
+        return {"ivr": None, "days_history": 0, "signal": "ERROR"}
+
 if __name__=="__main__":
     logging.basicConfig(level=logging.INFO); init_db()
     s=get_performance_stats()
@@ -436,3 +792,59 @@ if __name__=="__main__":
     lessons=get_lessons(5)
     print(f"\nRecent Lessons ({len(lessons)}):")
     for l in lessons: print(f"  {l['symbol']} {l['outcome']} {l['pnl_pct']:+.1f}%: {l['lesson'][:80]}")
+
+def get_trade_alert_data(trade_id: int) -> dict:
+    """Return formatted alert data for a trade (for Telegram notifications)."""
+    conn = _conn()
+    trade = conn.execute("SELECT * FROM trades WHERE id=?", (trade_id,)).fetchone()
+    conn.close()
+    if not trade:
+        return {}
+
+    t = dict(trade)
+    if t["status"] == "OPEN":
+        return {
+            "alert_type": "ENTRY",
+            "symbol": t["symbol"],
+            "direction": t["direction"],
+            "entry_price": t["entry_price"],
+            "entry_option_price": t["entry_option_price"],
+            "strike": t["strike"],
+            "expiry": t["expiry"],
+            "reason": t["reason"],
+            "spread_type": t.get("spread_type", ""),
+            "credit_received": t.get("credit_received", 0),
+            "dte_profile": t.get("dte_profile", "30DTE"),
+            "regime": t.get("regime", "NORMAL"),
+        }
+    elif t["status"] in ("WIN", "LOSS"):
+        return {
+            "alert_type": "EXIT",
+            "symbol": t["symbol"],
+            "direction": t["direction"],
+            "entry_price": t["entry_price"],
+            "exit_price": t["exit_price"],
+            "pnl_pct": t["pnl_pct"],
+            "pnl_dollars": t["pnl_dollar"],
+            "outcome": t["status"],
+            "outcome_reason": t["outcome_reason"],
+            "days_held": t.get("days_held", 0),
+        }
+    return {}
+
+def get_open_trades_alert_summary() -> str:
+    """Return text summary of all open trades for Telegram update."""
+    conn = _conn()
+    trades = conn.execute("SELECT * FROM trades WHERE status='OPEN' ORDER BY created_at DESC").fetchall()
+    conn.close()
+
+    if not trades:
+        return "📭 No open trades"
+
+    lines = [f"📊 <b>Open Trades ({len(trades)})</b>"]
+    for t in trades:
+        t = dict(t)
+        pnl_indicator = "📈" if (t.get("max_price", 0) - t["entry_price"]) > 0 else "📉"
+        lines.append(f"{pnl_indicator} <b>{t['symbol']}</b> | {t['direction']} @ ${t['entry_price']:.2f} | {t['dte_profile']}")
+
+    return "\n".join(lines)

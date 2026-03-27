@@ -20,6 +20,18 @@ except ImportError:
     def _get_social_sentiment(symbol, wsb_data=None):
         return {"composite_social_score": 50.0, "is_bearish_social": False, "is_bullish_social": False}
 
+try:
+    from paper_trader import get_recommendation_confidence as _get_recommendation_confidence
+except ImportError:
+    def _get_recommendation_confidence():
+        return {s: {"confidence": 50} for s in ["top_call", "top_put", "dte_pick", "dte_spread", "manual"]}
+
+try:
+    from paper_trader import store_iv_snapshot as _store_iv_snapshot, get_iv_rank as _get_iv_rank
+except ImportError:
+    def _store_iv_snapshot(symbol, iv): pass
+    def _get_iv_rank(symbol, iv): return {"ivr": None, "signal": "INSUFFICIENT_HISTORY"}
+
 # Suppress noisy yfinance/urllib3 HTTP error prints
 for _noisy in ("yfinance","urllib3","peewee","yfinance.utils","yfinance.base"):
     logging.getLogger(_noisy).setLevel(logging.CRITICAL)
@@ -276,17 +288,122 @@ def build_spread(d, direction, score, dte_profile):
         "bias_note":      bias_note,
     }
 
+def build_iron_condor(d, score, dte_profile="30DTE"):
+    """
+    Build an Iron Condor: sell OTM call spread + sell OTM put spread.
+    Profits from "sideways market" — stock stays between upper and lower strikes.
+
+    Strategy: For medium-confidence signals (40-65 score), iron condor is safer than naked calls/puts.
+    - Sell call spread above current price (profit if stays below)
+    - Sell put spread below current price (profit if stays above)
+    - Combined probability: ~80-85% of max profit
+
+    Returns structured dict with both spreads combined.
+    """
+    # Don't build IC when IV is historically cheap (not enough premium)
+    ivr = d.get("ivr")
+    if ivr is not None and ivr < 25:
+        return None
+
+    price = d["price"]
+    iv_pct = d.get("iv_pct", 30)
+
+    # Spread width for iron condor: tighter than single spreads (around 3-4% per side)
+    raw_width = max(2.5, min(15, round(price * 0.04)))
+    if price >= 200:
+        spread_width = round(raw_width / 5) * 5
+    elif price >= 50:
+        spread_width = round(raw_width / 2.5) * 2.5
+    else:
+        spread_width = round(raw_width)
+
+    # Credit calculation: ~30% of spread width per side, combined from both spreads
+    credit_pct = 0.30 + (iv_pct - 30) * 0.003
+    credit_pct = max(0.20, min(0.45, credit_pct))
+    credit_per_side = round(spread_width * credit_pct, 2)
+    total_credit = round(credit_per_side * 2, 2)  # both call and put side collect credit
+    max_loss_per_side = round(spread_width - credit_per_side, 2)
+    total_max_loss = round(max_loss_per_side * 2, 2)  # both sides can max loss simultaneously
+
+    # ── Call Spread (Bear Call): sell OTM calls ──────────────────────────────
+    # Target: 15-20 delta (ATM ≈ 50 delta, 15-20 delta is safely OTM)
+    # Approximation: each 1% move ≈ 2 delta change, so 15 delta ≈ 7.5% OTM
+    call_otm_pct = 0.02 if score >= 55 else 0.03  # tighter if more confident
+    short_call_strike = _round_strike(price, price * (1 + call_otm_pct))
+    long_call_strike = _round_strike(price, short_call_strike + spread_width)
+    call_breakeven = round(short_call_strike + credit_per_side, 2)
+
+    # ── Put Spread (Bull Put): sell OTM puts ───────────────────────────────
+    # Target: 15-20 delta (same risk as call side)
+    put_otm_pct = 0.02 if score >= 55 else 0.03
+    short_put_strike = _round_strike(price, price * (1 - put_otm_pct))
+    long_put_strike = _round_strike(price, short_put_strike - spread_width)
+    put_breakeven = round(short_put_strike - credit_per_side, 2)
+
+    # Exit targets
+    take_profit_50 = round(total_credit * 0.50, 2)  # Close at 50% of total credit
+    take_profit_100 = total_credit
+    stop_loss = round(total_max_loss * 0.75, 2)  # Close if IC worth 75% of max loss
+
+    # Boost probability of profit when IV is high (better for selling premium)
+    pop_str = "~80-85%"
+    if ivr is not None and ivr > 60:
+        pop_str = "~85-90%"  # Higher IVR = more premium, better odds
+        # Actually increase credit slightly when IV is very elevated
+        total_credit = round(total_credit * 1.05, 2)
+
+    return {
+        "strategy_type": "IRON CONDOR",
+        "dte_profile": dte_profile,
+        # Call Spread (upper half)
+        "call_spread_type": "BEAR CALL SPREAD",
+        "call_short_strike": short_call_strike,
+        "call_long_strike": long_call_strike,
+        "call_width": spread_width,
+        "call_credit": credit_per_side,
+        "call_breakeven": call_breakeven,
+        # Put Spread (lower half)
+        "put_spread_type": "BULL PUT SPREAD",
+        "put_short_strike": short_put_strike,
+        "put_long_strike": long_put_strike,
+        "put_width": spread_width,
+        "put_credit": credit_per_side,
+        "put_breakeven": put_breakeven,
+        # Combined IC metrics
+        "total_credit": total_credit,           # Total premium collected ($×100 per contract)
+        "max_profit": total_credit,
+        "max_loss": total_max_loss,
+        "max_loss_per_side": max_loss_per_side,
+        "take_profit_50": take_profit_50,
+        "take_profit_100": take_profit_100,
+        "stop_loss_at": stop_loss,
+        "profit_zone": f"${short_put_strike:.2f} - ${short_call_strike:.2f}",
+        "probability_of_profit": pop_str,
+        "ivr_boosted": ivr is not None and ivr > 60,
+        "bias_note": f"Profit if stock stays between ${short_put_strike:.2f} and ${short_call_strike:.2f}",
+    }
+
 # ── Fetch ticker data ─────────────────────────────────────────────────────────
 def fetch_ticker_data(symbol):
     try:
         tk = yf.Ticker(symbol)
         hist_1y  = tk.history(period="1y",  interval="1d")
         hist_3mo = tk.history(period="3mo", interval="1d")
-        hist_5d  = tk.history(period="5d",  interval="1h")
+        hist_5d  = tk.history(period="5d",  interval="1h", prepost=True)  # Include pre-market data
         if hist_3mo.empty or len(hist_3mo)<20: return None
         price      = float(hist_3mo["Close"].iloc[-1])
         prev_close = float(hist_3mo["Close"].iloc[-2])
         pct_change = round((price-prev_close)/prev_close*100, 2)
+        # Pre-market gap detection
+        premarket_gap_pct = 0.0
+        try:
+            from datetime import time as dt_time
+            if hasattr(hist_5d.index, 'time'):
+                premarket_bars = hist_5d[hist_5d.index.time < dt_time(9, 30)]
+                if not premarket_bars.empty:
+                    premarket_close = float(premarket_bars["Close"].iloc[-1])
+                    premarket_gap_pct = round((premarket_close - prev_close) / prev_close * 100, 2)
+        except: pass
         avg_vol_20 = float(hist_3mo["Volume"].tail(20).mean())
         today_vol  = float(hist_3mo["Volume"].iloc[-1])
         if price < 5.0 or avg_vol_20 < 300_000: return None
@@ -317,6 +434,8 @@ def fetch_ticker_data(symbol):
         iv  = 0.30
         # {expiry: {"calls":{strike:{bid,ask,mid}}, "puts":{...}}}
         stored_chains = {}; available_expiries = []
+        # Initialize variables for option chain metrics (will be filled in loop or kept as defaults)
+        calls_vol = 0; puts_vol = 0; calls_oi = 0; puts_oi = 0; chain = None
         try:
             exps = tk.options
             if exps:
@@ -346,6 +465,19 @@ def fetch_ticker_data(symbol):
                             "calls": _extract(chain.calls),
                             "puts":  _extract(chain.puts),
                         }
+
+                        # Extract option chain volume/OI metrics for this expiry
+                        if not chain.calls.empty:
+                            calls_vol = chain.calls['volume'].fillna(0).sum() if 'volume' in chain.calls else 0
+                            calls_oi  = chain.calls['openInterest'].fillna(0).sum() if 'openInterest' in chain.calls else 0
+                        else:
+                            calls_vol = calls_oi = 0
+                        if not chain.puts.empty:
+                            puts_vol = chain.puts['volume'].fillna(0).sum() if 'volume' in chain.puts else 0
+                            puts_oi  = chain.puts['openInterest'].fillna(0).sum() if 'openInterest' in chain.puts else 0
+                        else:
+                            puts_vol = puts_oi = 0
+
                         # Get IV from ATM calls
                         if not chain.calls.empty and "impliedVolatility" in chain.calls:
                             atm = chain.calls[abs(chain.calls["strike"]-price)<price*0.07]
@@ -354,13 +486,14 @@ def fetch_ticker_data(symbol):
                                 if len(iv_vals)>0: iv = max(0.05, min(float(iv_vals.mean()), 5.0))
                     except: pass
         except: pass
-        debt_to_equity=0.0; market_cap=0.0
+        debt_to_equity=0.0; market_cap=0.0; short_pct_float=0.0
         if symbol not in ETF_TICKERS:
             try:
                 fi = tk.info
                 de = fi.get("debtToEquity",0) or 0
                 debt_to_equity = float(de)/100
                 market_cap     = float(fi.get("marketCap",0) or 0)
+                short_pct_float = float(fi.get("shortPercentOfFloat", 0) or 0)
             except: pass
         days_to_earnings=999
         try:
@@ -385,6 +518,37 @@ def fetch_ticker_data(symbol):
         hv_src = hist_1y if not hist_1y.empty and len(hist_1y) >= 35 else hist_3mo
         vol_data = hv_iv_analysis(hv_src, iv, window=30)
 
+        # ── Store IV snapshot and compute IV Rank ────────────────────────────
+        _store_iv_snapshot(symbol, iv)
+        iv_rank_data = _get_iv_rank(symbol, iv)
+        ivr = iv_rank_data.get("ivr")
+
+        # ── Compute option chain metrics (from last fetched expiry) ─────────────
+        pc_volume_ratio = 1.0; uoa_flag = False; atm_spread_pct = 0.15
+        if calls_vol > 0:
+            pc_volume_ratio = round(puts_vol / calls_vol, 2)
+        # Unusual options activity: volume > 3x OI on any single strike
+        if chain is not None:
+            try:
+                all_chains = pd.concat([chain.calls, chain.puts]) if not chain.calls.empty and not chain.puts.empty else (chain.calls if not chain.calls.empty else chain.puts)
+                if not all_chains.empty and 'volume' in all_chains and 'openInterest' in all_chains:
+                    for _, row in all_chains.iterrows():
+                        vol = float(row.get('volume', 0) or 0)
+                        oi = float(row.get('openInterest', 0) or 0)
+                        if oi > 0 and vol > 3 * oi and vol > 500:
+                            uoa_flag = True
+                            break
+            except: pass
+            # ATM bid/ask spread quality
+            try:
+                if not chain.calls.empty:
+                    atm_call = chain.calls.iloc[(chain.calls['strike'] - price).abs().argsort()[:1]]
+                    if not atm_call.empty:
+                        bid = float(atm_call['bid'].iloc[0] or 0)
+                        ask = float(atm_call['ask'].iloc[0] or 0)
+                        atm_spread_pct = (ask - bid) / ask if ask > 0 else 0.15
+            except: pass
+
         return {
             "symbol":symbol,"price":round(price,2),"pct_change":pct_change,
             "move_4h":move_4h,"rel_volume":rel_volume,"avg_volume":int(avg_vol_20),
@@ -401,6 +565,12 @@ def fetch_ticker_data(symbol):
             "days_to_earnings":days_to_earnings,
             "is_war_sector":symbol in WAR_TICKERS,"is_distressed":symbol in DISTRESSED_TICKERS,
             "stored_chains":stored_chains,"available_expiries":available_expiries,
+            "premarket_gap_pct":premarket_gap_pct,
+            "short_pct_float":round(short_pct_float, 2),
+            "pc_volume_ratio":pc_volume_ratio,
+            "uoa_flag":uoa_flag,
+            "atm_spread_pct":round(atm_spread_pct, 3),
+            "ivr":ivr,
             "fetched_at":datetime.now().isoformat(),
         }
     except Exception as e:
@@ -457,6 +627,43 @@ def score_for_call(d, w=None, sentiment=None):
             score += 5
             reasons.append(f"WSB trending #{sentiment.get('wsb_rank', 0)}")
 
+    # ── New signal: IVR (IV Rank) ────────────────────────────────────────────
+    ivr = d.get("ivr")
+    if ivr is not None:
+        if ivr < 25:
+            score += 12
+            reasons.append(f"📈 IVR {ivr:.0f}% (cheap)")
+        elif ivr < 40:
+            score += 5
+            reasons.append(f"IVR {ivr:.0f}%")
+        elif ivr > 70:
+            score -= 10
+            reasons.append(f"⚠️ IVR {ivr:.0f}% (expensive, prefer IC)")
+
+    # ── Unusual options activity ─────────────────────────────────────────────
+    if d.get("uoa_flag"):
+        score += 12
+        reasons.append("🔥 Unusual options activity")
+
+    # ── Pre-market gap ───────────────────────────────────────────────────────
+    gap = d.get("premarket_gap_pct", 0)
+    if gap > 3:
+        score += 8
+        reasons.append(f"☀️ Pre-mkt gap +{gap:.1f}%")
+    elif gap < -3:
+        score -= 8
+        reasons.append(f"Pre-mkt gap {gap:.1f}%")
+
+    # ── Short squeeze setup ──────────────────────────────────────────────────
+    if d.get("short_pct_float", 0) > 0.15 and d.get("wsb_score", 0) > 50:
+        score += 12
+        reasons.append(f"💥 Squeeze: {d['short_pct_float']*100:.0f}% short + WSB")
+
+    # ── Bid/ask spread quality ───────────────────────────────────────────────
+    if d.get("atm_spread_pct", 0) > 0.15:
+        score -= 8
+        reasons.append("⚠️ Wide bid/ask spread")
+
     return min(100, max(0, score)), " | ".join(reasons[:3]) if reasons else "Mixed signals"
 
 def score_for_put(d, w=None, sentiment=None):
@@ -508,6 +715,44 @@ def score_for_put(d, w=None, sentiment=None):
             adj = max(-15, -int((bull_pct - 65) * 0.5) - 5)
             score += adj
             reasons.append(f"📱 Social bull {bull_pct:.0f}%")
+
+    # ── IVR scoring (same for puts - high IVR = expensive puts) ──────────────
+    ivr = d.get("ivr")
+    if ivr is not None:
+        if ivr < 25:
+            score += 12
+            reasons.append(f"📈 IVR {ivr:.0f}% (cheap)")
+        elif ivr < 40:
+            score += 5
+            reasons.append(f"IVR {ivr:.0f}%")
+        elif ivr > 70:
+            score -= 10
+            reasons.append(f"⚠️ IVR {ivr:.0f}% (expensive)")
+
+    # ── Unusual options activity ─────────────────────────────────────────────
+    if d.get("uoa_flag"):
+        score += 12
+        reasons.append("🔥 Unusual options activity")
+
+    # ── Pre-market gap (negative gap = bullish for puts) ─────────────────────
+    gap = d.get("premarket_gap_pct", 0)
+    if gap < -3:
+        score += 8
+        reasons.append(f"🌑 Pre-mkt gap {gap:.1f}%")
+    elif gap > 3:
+        score -= 8
+        reasons.append(f"Pre-mkt gap +{gap:.1f}%")
+
+    # ── P/C volume ratio > 1.5 = heavy put buying = bearish flow ───────────
+    pc_ratio = d.get("pc_volume_ratio", 1.0)
+    if pc_ratio > 1.5:
+        score += 8
+        reasons.append(f"Put buying {pc_ratio:.1f}x")
+
+    # ── Bid/ask spread quality ───────────────────────────────────────────────
+    if d.get("atm_spread_pct", 0) > 0.15:
+        score -= 8
+        reasons.append("⚠️ Wide bid/ask spread")
 
     return min(100, max(0, score)), " | ".join(reasons[:3]) if reasons else "Bearish signals"
 
@@ -655,11 +900,15 @@ def run_scan_dte_profiles(learning_weights=None):
     """Run full scan with 6-phase market intelligence integration."""
     log.info("Running DTE-profile scan with market intelligence...")
 
-    # ── Phase 1: Market intelligence signals ────────────────────────────────
+    # ── Phase 1: Market intelligence signals and recommendation confidence ────
     market_intel = _get_market_intel()
     market_bias = market_intel.get("market_bias", "NEUTRAL")
     wsb_data = market_intel.get("wsb_trending", [])
+    rec_confidence = _get_recommendation_confidence()  # Read confidence scores for each source
     log.info(f"Market intel: {market_intel.get('context_summary', 'unavailable')}")
+    log.info(f"Recommendation confidence: top_call={rec_confidence.get('top_call',{}).get('confidence',50)}%, "
+             f"top_put={rec_confidence.get('top_put',{}).get('confidence',50)}%, "
+             f"dte_pick={rec_confidence.get('dte_pick',{}).get('confidence',50)}%")
 
     # ── Phase 2: Initial scan (unchanged) ──────────────────────────────────
     base   = run_scan(learning_weights=learning_weights)
@@ -689,6 +938,23 @@ def run_scan_dte_profiles(learning_weights=None):
                 r["social_sentiment"] = sent
             except Exception as e:
                 log.debug(f"Social sentiment {r['symbol']}: {e}")
+
+    # ── Phase 3b: Apply confidence multiplier to scores ─────────────────────
+    # DTE picker recommendations will have "dte_pick" source, so apply that confidence
+    # top_call/top_put sources are handled in bot_patch3.py (separate picking logic)
+    dte_conf_mult = rec_confidence.get("dte_pick", {}).get("confidence", 50) / 100.0
+    if dte_conf_mult < 1.0:  # Only log if confidence is below 100%
+        log.info(f"Applying DTE confidence multiplier {dte_conf_mult:.2f} to all DTE-picker recommendations")
+        for r in results:
+            # Reduce both call and put scores by confidence multiplier
+            # This makes low-confidence DTE picks less likely to be selected
+            original_call = r["call_score"]
+            original_put = r["put_score"]
+            r["call_score"] = round(r["call_score"] * dte_conf_mult)
+            r["put_score"] = round(r["put_score"] * dte_conf_mult)
+            if original_call != r["call_score"] or original_put != r["put_score"]:
+                r["call_reason"] = f"[conf {rec_confidence.get('dte_pick', {}).get('confidence', 50)}%] " + r.get("call_reason", "")
+                r["put_reason"] = f"[conf {rec_confidence.get('dte_pick', {}).get('confidence', 50)}%] " + r.get("put_reason", "")
 
     # ── Phase 4: Apply QQQ/SPY context boosts ──────────────────────────────
     for r in results:
@@ -740,7 +1006,30 @@ def run_scan_dte_profiles(learning_weights=None):
         "30DTE": _pick_unique(_pick_30dte, biased_results),
         "60DTE": _pick_unique(_pick_60dte, biased_results),
     }
-    return {**base, "dte_picks":picks, "regime":regime, "market_intel":market_intel}
+
+    # ── Add Iron Condor entries for medium-confidence picks ──────────────────
+    # If score is 40-65 (uncertain direction), build IC instead of naked option
+    for dte_tier, pick in picks.items():
+        if pick is None:
+            continue
+        call_score = pick.get("call_score", 0)
+        put_score = pick.get("put_score", 0)
+        max_score = max(call_score, put_score)
+
+        # Only build IC if medium confidence (40-65 is uncertain/choppy)
+        if 40 <= max_score <= 65:
+            try:
+                ic = build_iron_condor(pick, max_score, dte_profile=dte_tier)
+                # Add IC entry to the pick
+                pick["iron_condor"] = ic
+                pick["ic_available"] = True
+            except Exception as e:
+                log.debug(f"Iron condor build {pick['symbol']} {dte_tier}: {e}")
+                pick["ic_available"] = False
+        else:
+            pick["ic_available"] = False
+
+    return {**base, "dte_picks":picks, "regime":regime, "market_intel":market_intel, "rec_confidence":rec_confidence}
 
 if __name__=="__main__":
     logging.basicConfig(level=logging.INFO,format="%(asctime)s [%(levelname)s] %(message)s")

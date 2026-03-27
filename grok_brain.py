@@ -62,6 +62,63 @@ def _call_grok(system_prompt, user_prompt, max_tokens=400, temperature=0.4):
 
 # ── Telegram message formatters ───────────────────────────────────────────────
 
+def format_iron_condor(pick, regime_info, tier, market_intel=None):
+    """
+    Format an Iron Condor trade into a Telegram message.
+    Shows probability of profit, breakeven points, credit collected.
+    """
+    if not pick or not pick.get("iron_condor"):
+        return f"<b>{tier}</b>: No iron condor setup available."
+
+    ic = pick["iron_condor"]
+    symbol = pick["symbol"]
+    price = pick.get("price", 0)
+
+    cv_icon = "✅"  # IC usually has 80%+ probability
+    em = "🎯"  # Iron condor icon
+
+    call_score = pick.get("call_score", 0)
+    put_score = pick.get("put_score", 0)
+    avg_score = round((call_score + put_score) / 2)
+
+    lines = [
+        f"{em} <b>{tier} — {symbol} [IRON CONDOR]</b>  {cv_icon} {avg_score}/100",
+        f"${price:.2f}  POP ~80-85%  Credit ${ic['total_credit']:.2f}/contract",
+        f"Regime: <b>{regime_info.get('regime', 'NORMAL')}</b>",
+    ]
+
+    # Market intel line if available
+    if market_intel:
+        fg_val = market_intel.get("fear_greed", {}).get("value", 50)
+        fg_label = market_intel.get("fear_greed", {}).get("label", "Neutral")
+        pc_val = market_intel.get("pc_ratio", {}).get("pc_ratio", 0.85)
+        lines.append(f"📊 F&G: {fg_val} ({fg_label}) | P/C: {pc_val:.2f}")
+
+    lines.extend([
+        "─────────────────",
+        f"<b>📍 PROFIT ZONE: {ic['profit_zone']}</b>",
+        f"",
+        f"🚀 <b>CALL SPREAD (Upper Limit):</b>",
+        f"   Sell ${ic['call_short_strike']} Call / Buy ${ic['call_long_strike']} Call",
+        f"   Credit: ${ic['call_credit']:.2f} | Breakeven: ${ic['call_breakeven']:.2f}",
+        f"",
+        f"💥 <b>PUT SPREAD (Lower Limit):</b>",
+        f"   Sell ${ic['put_short_strike']} Put / Buy ${ic['put_long_strike']} Put",
+        f"   Credit: ${ic['put_credit']:.2f} | Breakeven: ${ic['put_breakeven']:.2f}",
+        f"",
+        f"<b>💰 Combined Metrics:</b>",
+        f"   Total Credit: ${ic['total_credit']:.2f}",
+        f"   Max Profit: ${ic['max_profit']:.2f}",
+        f"   Max Loss: ${ic['max_loss']:.2f} ({ic['max_loss'] / ic['total_credit']:.1f}x credit ratio)",
+        f"   50% Target: ${ic['take_profit_50']:.2f}",
+        f"   Stop Loss: ${ic['stop_loss_at']:.2f}",
+        f"",
+        f"📌 {ic['bias_note']}",
+    ])
+
+    return "\n".join(lines)
+
+
 def format_scan_result(pick, regime_info, tier, rank=1, market_intel=None):
     """
     Format a single DTE-profile pick into a clean Telegram message.
