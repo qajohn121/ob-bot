@@ -72,86 +72,95 @@ def calculate_pnl(trade):
 @app.route("/api/trades")
 def get_trades():
     """API endpoint for all trades"""
-    db = get_db()
-    trades = db.execute("SELECT * FROM trades ORDER BY created_at DESC").fetchall()
+    try:
+        db = get_db()
+        trades = db.execute("SELECT * FROM trades ORDER BY created_at DESC").fetchall()
 
-    result = []
-    for t in trades:
-        t_dict = dict(t)
-        pnl_pct, pnl_dollar = calculate_pnl(t_dict)
+        result = []
+        for t in trades:
+            try:
+                t_dict = dict(t)
+                pnl_pct, pnl_dollar = calculate_pnl(t_dict)
 
-        # Format spread indicator
-        spread_type = t_dict.get("spread_type") or ""
-        is_spread = " (SPREAD)" if spread_type else ""
+                # Format spread indicator
+                spread_type = t_dict.get("spread_type") or ""
+                is_spread = " [SPREAD]" if spread_type else ""
 
-        result.append({
-            "id": t_dict["id"],
-            "symbol": t_dict["symbol"],
-            "type": f"{t_dict['direction']}{is_spread}",
-            "spread_type": spread_type,
-            "status": t_dict["status"],
-            "entry_price": t_dict["entry_price"],
-            "entry_time": est_time(t_dict["created_at"]),
-            "exit_price": t_dict.get("exit_price"),
-            "exit_time": est_time(t_dict["closed_at"]) if t_dict.get("closed_at") else None,
-            "dte_profile": t_dict.get("dte_profile"),
-            "pnl_pct": pnl_pct,
-            "pnl_dollar": pnl_dollar,
-            "reason": (t_dict.get("reason") or "")[:60],
-            "days_held": (datetime.now(EST) - datetime.fromisoformat(t_dict["created_at"]).astimezone(EST)).days,
-            "credit": float(t_dict.get("credit_received", 0) or 0),
-            "strike": t_dict.get("strike"),
-            "short_strike": t_dict.get("short_strike"),
-            "long_strike": t_dict.get("long_strike")
+                result.append({
+                    "id": t_dict["id"],
+                    "symbol": t_dict["symbol"],
+                    "type": f"{t_dict['direction']}{is_spread}",
+                    "spread_type": spread_type,
+                    "status": t_dict["status"],
+                    "entry_price": float(t_dict.get("entry_price", 0)),
+                    "entry_time": est_time(t_dict["created_at"]),
+                    "exit_price": t_dict.get("exit_price"),
+                    "exit_time": est_time(t_dict["closed_at"]) if t_dict.get("closed_at") else None,
+                    "dte_profile": t_dict.get("dte_profile"),
+                    "pnl_pct": pnl_pct,
+                    "pnl_dollar": pnl_dollar,
+                    "reason": (t_dict.get("reason") or "")[:60],
+                    "days_held": (datetime.now(EST) - datetime.fromisoformat(t_dict["created_at"]).astimezone(EST)).days,
+                    "credit": float(t_dict.get("credit_received", 0) or 0),
+                })
+            except Exception as e:
+                log.debug(f"Trade row error: {e}")
+                continue
+
+        db.close()
+        return jsonify({
+            "timestamp": datetime.now(EST).strftime("%m/%d %H:%M:%S EST"),
+            "total_trades": len(trades),
+            "open_count": len([t for t in result if t["status"] == "OPEN"]),
+            "trades": result
         })
-
-    db.close()
-    return jsonify({
-        "timestamp": datetime.now(EST).strftime("%m/%d %H:%M:%S EST"),
-        "total_trades": len(trades),
-        "open_count": len([t for t in result if t["status"] == "OPEN"]),
-        "trades": result
-    })
+    except Exception as e:
+        log.error(f"Trades endpoint error: {e}")
+        return jsonify({"error": str(e), "trades": []}), 500
 
 @app.route("/api/summary")
 def get_summary():
     """Performance summary with real-time P&L"""
-    db = get_db()
+    try:
+        db = get_db()
 
-    total = db.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
-    wins = db.execute("SELECT COUNT(*) FROM trades WHERE status='WIN'").fetchone()[0]
-    losses = db.execute("SELECT COUNT(*) FROM trades WHERE status='LOSS'").fetchone()[0]
-    open_count = db.execute("SELECT COUNT(*) FROM trades WHERE status='OPEN'").fetchone()[0]
+        total = db.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
+        wins = db.execute("SELECT COUNT(*) FROM trades WHERE status='WIN'").fetchone()[0]
+        losses = db.execute("SELECT COUNT(*) FROM trades WHERE status='LOSS'").fetchone()[0]
+        open_count = db.execute("SELECT COUNT(*) FROM trades WHERE status='OPEN'").fetchone()[0]
 
-    # Calculate closed P&L
-    closed_pnl = db.execute("SELECT COALESCE(SUM(pnl_dollar), 0) FROM trades WHERE status IN ('WIN','LOSS')").fetchone()[0]
+        # Calculate closed P&L
+        closed_pnl = db.execute("SELECT COALESCE(SUM(pnl_dollar), 0) FROM trades WHERE status IN ('WIN','LOSS')").fetchone()[0]
 
-    # Calculate open trades P&L in real-time
-    open_trades = db.execute("SELECT * FROM trades WHERE status='OPEN'").fetchall()
-    open_pnl = 0.0
+        # Calculate open trades P&L in real-time
+        open_trades = db.execute("SELECT * FROM trades WHERE status='OPEN'").fetchall()
+        open_pnl = 0.0
 
-    for t in open_trades:
-        try:
-            pnl_pct, pnl_dollar = calculate_pnl(dict(t))
-            open_pnl += pnl_dollar
-        except Exception as e:
-            log.debug(f"Open trade P&L error: {e}")
+        for t in open_trades:
+            try:
+                pnl_pct, pnl_dollar = calculate_pnl(dict(t))
+                open_pnl += pnl_dollar
+            except Exception as e:
+                log.debug(f"Open trade P&L error: {e}")
 
-    total_pnl = closed_pnl + open_pnl
+        total_pnl = closed_pnl + open_pnl
 
-    db.close()
+        db.close()
 
-    return jsonify({
-        "total_trades": total,
-        "win_count": wins,
-        "loss_count": losses,
-        "open_count": open_count,
-        "win_rate": f"{(wins/total*100):.1f}%" if total > 0 else "0%",
-        "closed_pnl": f"${closed_pnl:+.2f}",
-        "open_pnl": f"${open_pnl:+.2f}",
-        "total_pnl": f"${total_pnl:+.2f}",
-        "timestamp": datetime.now(EST).strftime("%m/%d %H:%M:%S EST")
-    })
+        return jsonify({
+            "total_trades": total,
+            "win_count": wins,
+            "loss_count": losses,
+            "open_count": open_count,
+            "win_rate": f"{(wins/total*100):.1f}%" if total > 0 else "0%",
+            "closed_pnl": f"${closed_pnl:+.2f}",
+            "open_pnl": f"${open_pnl:+.2f}",
+            "total_pnl": f"${total_pnl:+.2f}",
+            "timestamp": datetime.now(EST).strftime("%m/%d %H:%M:%S EST")
+        })
+    except Exception as e:
+        log.error(f"Summary endpoint error: {e}")
+        return jsonify({"error": str(e)}), 500
 
 HTML = """
 <!DOCTYPE html>
@@ -172,75 +181,18 @@ HTML = """
         th, td { padding: 8px; text-align: left; border-bottom: 1px solid #333; }
         th { background: #1a1f3a; color: #ffff00; font-weight: bold; }
         tr:hover { background: #1a1f3a; }
-        .spread-badge { background: #ffff00; color: #000; padding: 2px 6px; border-radius: 3px; font-size: 10px; font-weight: bold; }
         .win { color: #00ff41; }
         .loss { color: #ff4444; }
         .open { color: #ffff00; }
-        .closed { color: #888; }
         footer { text-align: center; padding: 15px; color: #888; font-size: 0.85em; border-top: 1px solid #333; }
         .refresh { text-align: right; padding: 10px 20px; color: #888; font-size: 0.85em; }
+        .error { color: #ff4444; padding: 20px; text-align: center; }
     </style>
-    <script>
-        setInterval(() => {
-            fetch('/api/summary').then(r => r.json()).then(data => {
-                const pnl_color = data.total_pnl.includes('-') ? 'negative' : '';
-                document.getElementById('summary').innerHTML = `
-                    <div class="stat">
-                        <div class="stat-label">Total Trades</div>
-                        <div class="stat-value">${data.total_trades}</div>
-                    </div>
-                    <div class="stat">
-                        <div class="stat-label">Win Rate</div>
-                        <div class="stat-value">${data.win_rate}</div>
-                    </div>
-                    <div class="stat">
-                        <div class="stat-label">Open</div>
-                        <div class="stat-value">${data.open_count}</div>
-                    </div>
-                    <div class="stat">
-                        <div class="stat-label">Closed P&L</div>
-                        <div class="stat-value">${data.closed_pnl}</div>
-                    </div>
-                    <div class="stat">
-                        <div class="stat-label">TOTAL P&L</div>
-                        <div class="stat-value ${pnl_color}">${data.total_pnl}</div>
-                    </div>
-                `);
-            });
-
-            fetch('/api/trades').then(r => r.json()).then(data => {
-                let html = `<tr><th>Symbol</th><th>Type</th><th>Entry</th><th>Entry Time</th><th>Days</th><th>P&L %</th><th>P&L $</th><th>Status</th><th>Credit</th><th>Reason</th></tr>`;
-                data.trades.forEach(t => {
-                    const status_class = t.status === 'OPEN' ? 'open' : (t.status === 'WIN' ? 'win' : 'loss');
-                    const pnl_class = t.pnl_pct >= 0 ? 'win' : 'loss';
-                    const spread_badge = t.spread_type ? `<span class="spread-badge">${t.spread_type}</span>` : '';
-                    const credit_display = t.credit > 0 ? `$${t.credit.toFixed(2)}` : '—';
-
-                    html += `
-                        <tr>
-                            <td><b>${t.symbol}</b></td>
-                            <td>${t.type} ${spread_badge}</td>
-                            <td>$${t.entry_price.toFixed(2)}</td>
-                            <td>${t.entry_time}</td>
-                            <td>${t.days_held}</td>
-                            <td class="${pnl_class}">${t.pnl_pct.toFixed(2)}%</td>
-                            <td class="${pnl_class}">$${t.pnl_dollar.toFixed(2)}</td>
-                            <td class="${status_class}">${t.status}</td>
-                            <td>${credit_display}</td>
-                            <td>${t.reason}</td>
-                        </tr>
-                    `;
-                });
-                document.getElementById('trades').innerHTML = html;
-                document.getElementById('refresh-time').textContent = data.timestamp;
-            });
-        }, 3000);
-    </script>
 </head>
 <body>
     <header>
-        <h1>🤖 OB Bot Trading Dashboard</h1>
-        <p>Real-time trading with live market data (EST timezone) | Option Spreads & Single Options</p>
+        <h1>OB Bot Trading Dashboard</h1>
+        <p>Real-time trading with live market data (EST timezone)</p>
     </header>
 
     <div id="summary" class="summary" style="opacity: 0.8;">
@@ -258,6 +210,85 @@ HTML = """
     <footer>
         All times in EST | Market hours: 9:30am - 4:00pm EST, Mon-Fri | Real market data from yfinance
     </footer>
+
+    <script>
+    function updateDashboard() {
+        // Fetch summary
+        fetch('/api/summary')
+            .then(response => response.json())
+            .then(data => {
+                if (data.error) {
+                    document.getElementById('summary').innerHTML = '<div class="error">Error loading summary: ' + data.error + '</div>';
+                    return;
+                }
+
+                let pnl_color = '';
+                if (data.total_pnl.includes('-')) {
+                    pnl_color = 'negative';
+                }
+
+                document.getElementById('summary').innerHTML =
+                    '<div class="stat"><div class="stat-label">Total Trades</div><div class="stat-value">' + data.total_trades + '</div></div>' +
+                    '<div class="stat"><div class="stat-label">Win Rate</div><div class="stat-value">' + data.win_rate + '</div></div>' +
+                    '<div class="stat"><div class="stat-label">Open</div><div class="stat-value">' + data.open_count + '</div></div>' +
+                    '<div class="stat"><div class="stat-label">Closed P&L</div><div class="stat-value">' + data.closed_pnl + '</div></div>' +
+                    '<div class="stat"><div class="stat-label">TOTAL P&L</div><div class="stat-value ' + pnl_color + '">' + data.total_pnl + '</div></div>';
+            })
+            .catch(err => {
+                document.getElementById('summary').innerHTML = '<div class="error">Error: ' + err.message + '</div>';
+            });
+
+        // Fetch trades
+        fetch('/api/trades')
+            .then(response => response.json())
+            .then(data => {
+                if (data.error) {
+                    document.getElementById('trades').innerHTML = '<tr><td colspan="10" class="error">Error: ' + data.error + '</td></tr>';
+                    return;
+                }
+
+                let html = '<tr><th>Symbol</th><th>Type</th><th>Entry</th><th>Entry Time</th><th>Days</th><th>P&L %</th><th>P&L $</th><th>Status</th><th>Credit</th><th>Reason</th></tr>';
+
+                if (data.trades && data.trades.length > 0) {
+                    data.trades.forEach(t => {
+                        let status_class = 'open';
+                        if (t.status === 'WIN') status_class = 'win';
+                        if (t.status === 'LOSS') status_class = 'loss';
+
+                        let pnl_class = 'win';
+                        if (t.pnl_pct < 0) pnl_class = 'loss';
+
+                        let credit_display = t.credit > 0 ? '$' + t.credit.toFixed(2) : '&mdash;';
+
+                        html += '<tr>' +
+                            '<td><b>' + t.symbol + '</b></td>' +
+                            '<td>' + t.type + '</td>' +
+                            '<td>$' + t.entry_price.toFixed(2) + '</td>' +
+                            '<td>' + t.entry_time + '</td>' +
+                            '<td>' + t.days_held + '</td>' +
+                            '<td class="' + pnl_class + '">' + t.pnl_pct.toFixed(2) + '%</td>' +
+                            '<td class="' + pnl_class + '">$' + t.pnl_dollar.toFixed(2) + '</td>' +
+                            '<td class="' + status_class + '">' + t.status + '</td>' +
+                            '<td>' + credit_display + '</td>' +
+                            '<td>' + t.reason + '</td>' +
+                            '</tr>';
+                    });
+                }
+
+                document.getElementById('trades').innerHTML = html;
+                document.getElementById('refresh-time').textContent = data.timestamp;
+            })
+            .catch(err => {
+                document.getElementById('trades').innerHTML = '<tr><td colspan="10" class="error">Error loading trades: ' + err.message + '</td></tr>';
+            });
+    }
+
+    // Initial load
+    updateDashboard();
+
+    // Refresh every 3 seconds
+    setInterval(updateDashboard, 3000);
+    </script>
 </body>
 </html>
 """
