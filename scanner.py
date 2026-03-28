@@ -749,11 +749,14 @@ def score_for_put(d, w=None, sentiment=None):
     return min(100, max(0, score)), " | ".join(reasons[:3]) if reasons else "Bearish signals"
 
 # ── Minimum score thresholds — never show a trade below these ─────────────────
-MIN_SCORE = {"0DTE": 75, "7DTE": 70, "21DTE": 68, "30DTE": 65, "60DTE": 60}
+# PHASE 3A: Lowered thresholds to generate 2-4 trades/day with new sentiment metrics
+# Previous: {"0DTE": 75, "7DTE": 70, "21DTE": 68, "30DTE": 65, "60DTE": 60}
+MIN_SCORE = {"0DTE": 65, "7DTE": 58, "21DTE": 55, "30DTE": 52, "60DTE": 48}
 
 # ── Minimum conviction gap — prevents ambiguous signals ─────────────────────
 # A signal is meaningless when call_score ≈ put_score. Require sufficient directional confidence.
-MIN_CONVICTION_GAP = {"0DTE": 20, "7DTE": 18, "21DTE": 15, "30DTE": 15, "60DTE": 12}
+# Also lowered slightly to allow more trades with sentiment backing
+MIN_CONVICTION_GAP = {"0DTE": 15, "7DTE": 12, "21DTE": 12, "30DTE": 10, "60DTE": 8}
 
 # ── DTE Profile Pickers ───────────────────────────────────────────────────────
 def _pick_0dte(results):
