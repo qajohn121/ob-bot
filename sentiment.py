@@ -10,9 +10,10 @@ NEWSAPI_KEY = os.getenv("NEWSAPI_KEY", "")
 BULLISH_KEYWORDS = [
     "beat","beats","exceeds","surprise","blowout","record","growth","upgrade","buy",
     "outperform","bullish","raises guidance","strong","partnership","contract","wins",
-    "awarded","approval","FDA","breakout","momentum","surge","soars","rockets","war",
-    "conflict","defense contract","military","NATO","energy crisis","oil spike","drill",
-    "LNG","gold rally","safe haven","inflation hedge",
+    "awarded","approval","FDA","breakout","momentum","surge","soars","rockets",
+    "defense contract","drill","LNG",
+    # REMOVED: "war","conflict","military","NATO","energy crisis","oil spike"
+    # These are handled separately via WAR_KEYWORDS for proper context-aware processing
 ]
 BEARISH_KEYWORDS = [
     "miss","misses","disappoints","shortfall","below expectations","downgrade","sell",
@@ -362,6 +363,19 @@ def _compute_full_sentiment(symbol):
     composite = max(-100, min(100, composite))
     war_hits  = yf_s.get("war_hits",  0) + news_s.get("war_hits",  0)
     bank_hits = yf_s.get("bank_hits", 0) + news_s.get("bank_hits", 0)
+
+    # ── WAR CATALYST ADJUSTMENT ──────────────────────────────────────────────
+    # When geopolitical stress detected (war_hits >= 2), force bearish sentiment.
+    # Geopolitical risk is immediate and market-wide, overriding other signals.
+    if war_hits >= 2:
+        if composite > 0:
+            # Reduce bullish confidence by 50%, add -20 bear bias
+            composite = composite * 0.5 - 20
+        else:
+            # Already bearish? Make it worse
+            composite = composite - 20
+        composite = max(-100, min(100, composite))
+
     return {
         "composite_score": round(composite, 1),
         "label": "bullish" if composite > 15 else ("bearish" if composite < -15 else "neutral"),
