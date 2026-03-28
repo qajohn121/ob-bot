@@ -11,11 +11,33 @@ import yfinance as yf
 from datetime import datetime, timezone, timedelta
 import json
 import logging
+from html import escape
+import time
 
 app = Flask(__name__)
 log = logging.getLogger("dashboard")
 
 EST = timezone(timedelta(hours=-5))
+
+# Price cache with 10-second TTL to prevent N+1 API calls
+_PRICE_CACHE = {}
+_CACHE_TTL = 10  # seconds
+
+def _init_db_indexes():
+    """Initialize database indexes for fast queries (idempotent)"""
+    try:
+        db = get_db()
+        # Index on status for fast WHERE status='OPEN' queries
+        db.execute("CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status)")
+        # Index on created_at DESC for fast ORDER BY queries
+        db.execute("CREATE INDEX IF NOT EXISTS idx_trades_created_at ON trades(created_at DESC)")
+        # Composite index for common WHERE + ORDER BY patterns
+        db.execute("CREATE INDEX IF NOT EXISTS idx_trades_status_created ON trades(status, created_at DESC)")
+        db.commit()
+        db.close()
+        log.info("Database indexes initialized")
+    except Exception as e:
+        log.warning(f"Could not initialize indexes: {e}")
 
 def get_db():
     db = sqlite3.connect("/home/ubuntu/ob-bot/data/trades.db")
@@ -27,48 +49,131 @@ def est_time(iso_str):
         dt = datetime.fromisoformat(iso_str)
         dt_est = dt.astimezone(EST)
         return dt_est.strftime("%m/%d %H:%M")
-    except:
+    except Exception as e:
+        log.debug(f"Could not parse datetime {iso_str}: {e}")
         return iso_str
 
 def get_live_price(symbol):
+    """Get live price with caching to prevent N+1 API calls"""
+    now = time.time()
+
+    # Check cache
+    if symbol in _PRICE_CACHE:
+        cached_price, cached_time = _PRICE_CACHE[symbol]
+        if now - cached_time < _CACHE_TTL:
+            return cached_price
+
+    # Fetch fresh price
     try:
         info = yf.Ticker(symbol).info
-        if "currentPrice" in info:
-            return float(info.get("currentPrice", 0))
+        price = info.get("currentPrice")
+        if price is not None:
+            _PRICE_CACHE[symbol] = (float(price), now)
+            return float(price)
         return None
-    except:
+    except Exception as e:
+        log.debug(f"Error fetching price for {symbol}: {e}")
         return None
 
-def calculate_pnl(trade):
-    if trade.get("status") != "OPEN":
-        return float(trade.get("pnl_pct", 0) or 0), float(trade.get("pnl_dollar", 0) or 0)
+def get_live_prices_batch(symbols):
+    """Fetch multiple prices efficiently (reduces API calls)"""
+    prices = {}
+    missing = []
+    now = time.time()
+
+    # Check cache for each symbol
+    for symbol in symbols:
+        if symbol in _PRICE_CACHE:
+            cached_price, cached_time = _PRICE_CACHE[symbol]
+            if now - cached_time < _CACHE_TTL:
+                prices[symbol] = cached_price
+            else:
+                missing.append(symbol)
+        else:
+            missing.append(symbol)
+
+    # Fetch only missing prices
+    if missing:
+        try:
+            tickers = yf.Tickers(" ".join(missing))
+            for symbol in missing:
+                try:
+                    price = tickers.tickers[symbol].info.get("currentPrice")
+                    if price is not None:
+                        price = float(price)
+                        _PRICE_CACHE[symbol] = (price, now)
+                        prices[symbol] = price
+                except Exception as e:
+                    log.debug(f"Error fetching price for {symbol}: {e}")
+        except Exception as e:
+            log.debug(f"Batch price fetch error: {e}")
+            # Fall back to individual fetches
+            for symbol in missing:
+                price = get_live_price(symbol)
+                if price is not None:
+                    prices[symbol] = price
+
+    return prices
+
+def calculate_pnl(trade, current_price=None):
+    """Calculate P&L for a trade. If current_price not provided, fetch it."""
+    status = trade.get("status")
+    if status != "OPEN":
+        try:
+            return float(trade.get("pnl_pct", 0) or 0), float(trade.get("pnl_dollar", 0) or 0)
+        except (ValueError, TypeError) as e:
+            log.debug(f"Error converting closed trade P&L: {e}")
+            return 0.0, 0.0
 
     try:
-        current_price = get_live_price(trade.get("symbol"))
-        if not current_price:
-            return 0, 0
+        if current_price is None:
+            current_price = get_live_price(trade.get("symbol"))
 
-        entry = float(trade.get("entry_price", 0))
-        if not entry:
-            return 0, 0
+        if current_price is None or current_price <= 0:
+            return 0.0, 0.0
 
-        if trade.get("direction") == "CALL":
+        entry = float(trade.get("entry_price", 0) or 0)
+        if entry <= 0:  # Fixed: check > 0 instead of `if not entry`
+            return 0.0, 0.0
+
+        direction = trade.get("direction", "").upper()
+        if direction == "CALL":
             pnl_pct = ((current_price - entry) / entry) * 100
-        else:
+        elif direction == "PUT":
             pnl_pct = ((entry - current_price) / entry) * 100
+        else:
+            return 0.0, 0.0
 
-        option_price = float(trade.get("entry_option_price") or (entry * 0.1))
+        # Safer option price conversion
+        try:
+            option_price = float(trade.get("entry_option_price", 0) or 0)
+        except (ValueError, TypeError):
+            option_price = entry * 0.1
+
+        if option_price <= 0:
+            option_price = entry * 0.1
+
         pnl_dollar = (pnl_pct / 100) * option_price * 100
         return round(pnl_pct, 2), round(pnl_dollar, 2)
-    except:
-        return 0, 0
+    except Exception as e:
+        log.debug(f"Error calculating P&L: {e}")
+        return 0.0, 0.0
 
 @app.route("/api/positions")
 def get_positions():
     """Get all positions formatted for Robinhood-style display"""
     try:
         db = get_db()
-        trades = db.execute("SELECT * FROM trades ORDER BY created_at DESC").fetchall()
+        # Fixed: SELECT specific columns instead of *
+        cols = "id, symbol, direction, strike, expiry, entry_price, created_at, status, spread_type, credit_received, short_strike, entry_option_price, reason"
+        trades = db.execute(f"SELECT {cols} FROM trades WHERE status IN ('OPEN', 'WIN', 'LOSS') ORDER BY created_at DESC").fetchall()
+
+        # Pre-compute EST now once for all datetime calculations (fix: datetime redundancy)
+        now_est = datetime.now(EST)
+
+        # Collect all symbols to batch-fetch prices
+        symbols = set(t["symbol"] for t in trades)
+        prices = get_live_prices_batch(list(symbols))
 
         positions = []
         spread_groups = {}  # Group spreads by symbol+expiry
@@ -76,13 +181,15 @@ def get_positions():
         for t in trades:
             try:
                 t_dict = dict(t)
+                symbol = t_dict.get("symbol")
+                current_price = prices.get(symbol)
 
                 # Group iron condors
                 if t_dict.get("spread_type") == "IRON CONDOR":
-                    key = f"{t_dict['symbol']}_{t_dict['expiry']}"
+                    key = f"{symbol}_{t_dict['expiry']}"
                     if key not in spread_groups:
                         spread_groups[key] = {
-                            "symbol": t_dict["symbol"],
+                            "symbol": symbol,
                             "expiry": t_dict["expiry"],
                             "entry_time": est_time(t_dict["created_at"]),
                             "created_at": t_dict["created_at"],
@@ -98,32 +205,39 @@ def get_positions():
                         "price": float(t_dict.get("entry_price", 0))
                     })
                 else:
-                    # Single option
-                    pnl_pct, pnl_dollar = calculate_pnl(t_dict)
+                    # Single option - pass pre-fetched price
+                    pnl_pct, pnl_dollar = calculate_pnl(t_dict, current_price)
+
+                    try:
+                        entry_time = datetime.fromisoformat(t_dict["created_at"]).astimezone(EST)
+                        days_held = (now_est - entry_time).days
+                    except (ValueError, TypeError) as e:
+                        log.debug(f"Error parsing created_at: {e}")
+                        days_held = 0
 
                     positions.append({
                         "type": "OPTION",
                         "id": t_dict["id"],
-                        "symbol": t_dict["symbol"],
-                        "direction": t_dict["direction"],
-                        "strike": float(t_dict.get("strike", 0)),
+                        "symbol": symbol,
+                        "direction": t_dict.get("direction", ""),
+                        "strike": float(t_dict.get("strike", 0) or 0),
                         "expiry": t_dict.get("expiry", "N/A"),
-                        "entry_price": float(t_dict.get("entry_price", 0)),
+                        "entry_price": float(t_dict.get("entry_price", 0) or 0),
                         "entry_time": est_time(t_dict["created_at"]),
-                        "days_held": (datetime.now(EST) - datetime.fromisoformat(t_dict["created_at"]).astimezone(EST)).days,
+                        "days_held": days_held,
                         "pnl_pct": pnl_pct,
                         "pnl_dollar": pnl_dollar,
-                        "status": t_dict["status"],
-                        "reason": (t_dict.get("reason") or "")[:100]
+                        "status": t_dict.get("status", ""),
+                        "reason": escape((t_dict.get("reason") or "")[:100])  # Fixed: HTML escape
                     })
             except Exception as e:
-                log.debug(f"Position error: {e}")
+                log.exception(f"Position parsing error: {e}")
                 continue
 
         # Add spreads to positions
         for key, spread in spread_groups.items():
             # Calculate spread P&L
-            total_pnl = 0
+            total_pnl = 0.0
             try:
                 pnl_pct, pnl_dollar = calculate_pnl({
                     "status": spread["status"],
@@ -133,8 +247,24 @@ def get_positions():
                     "entry_option_price": spread.get("credit", 0) or 1
                 })
                 total_pnl = pnl_dollar
-            except:
-                pass
+            except Exception as e:
+                log.debug(f"Spread P&L error: {e}")
+
+            try:
+                created_time = datetime.fromisoformat(spread["created_at"]).astimezone(EST)
+                days_held = (now_est - created_time).days
+            except (ValueError, TypeError) as e:
+                log.debug(f"Error parsing spread created_at: {e}")
+                days_held = 0
+
+            credit_received = float(spread.get("credit", 0) or 0)
+            max_loss = 0.0
+            if spread["legs"] and len(spread["legs"]) > 1:
+                try:
+                    strike_diff = abs(float(spread["legs"][0]["strike"]) - float(spread["legs"][-1]["strike"]))
+                    max_loss = round(max(0, strike_diff - credit_received), 2)
+                except (ValueError, IndexError, TypeError) as e:
+                    log.debug(f"Error calculating max loss: {e}")
 
             positions.append({
                 "type": "SPREAD",
@@ -142,41 +272,45 @@ def get_positions():
                 "symbol": spread["symbol"],
                 "expiry": spread["expiry"],
                 "entry_time": spread["entry_time"],
-                "days_held": (datetime.now(EST) - datetime.fromisoformat(spread["created_at"]).astimezone(EST)).days,
-                "credit_received": spread["credit"],
-                "max_profit": spread["credit"],
-                "max_loss": round(abs(spread["legs"][0]["strike"] - spread["legs"][-1]["strike"] - spread["credit"]), 2) if len(spread["legs"]) > 0 else 0,
+                "days_held": days_held,
+                "credit_received": credit_received,
+                "max_profit": credit_received,
+                "max_loss": max_loss,
                 "pnl_dollar": total_pnl,
-                "pnl_pct": round((total_pnl / spread["credit"] * 100), 2) if spread["credit"] > 0 else 0,
+                "pnl_pct": round((total_pnl / credit_received * 100), 2) if credit_received > 0 else 0.0,
                 "status": spread["status"],
-                "legs": spread["legs"]
+                "legs": spread["legs"],
+                "reason": escape(spread.get("reason", "")[:100])  # Fixed: HTML escape
             })
 
         db.close()
 
         # Calculate totals
-        total_pnl = sum([p.get("pnl_dollar", 0) for p in positions])
-        open_count = len([p for p in positions if p.get("status") == "OPEN"])
+        total_pnl = sum(p.get("pnl_dollar", 0) for p in positions)
+        open_count = sum(1 for p in positions if p.get("status") == "OPEN")
 
         return jsonify({
-            "timestamp": datetime.now(EST).strftime("%m/%d %H:%M:%S EST"),
+            "timestamp": now_est.strftime("%m/%d %H:%M:%S EST"),
             "positions": positions,
             "summary": {
                 "total_positions": len(positions),
                 "open_count": open_count,
                 "total_pnl": round(total_pnl, 2),
-                "total_pnl_pct": 0
+                "total_pnl_pct": 0.0
             }
         })
     except Exception as e:
-        log.error(f"Positions error: {e}")
-        return jsonify({"error": str(e), "positions": []}), 500
+        log.exception(f"Positions error: {e}")
+        return jsonify({"error": escape(str(e)), "positions": []}), 500
 
 @app.route("/api/summary")
 def get_summary():
     """Get summary stats"""
     try:
         db = get_db()
+        now_est = datetime.now(EST)
+
+        # Use indexes for fast count queries
         total = db.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
         wins = db.execute("SELECT COUNT(*) FROM trades WHERE status='WIN'").fetchone()[0]
         losses = db.execute("SELECT COUNT(*) FROM trades WHERE status='LOSS'").fetchone()[0]
@@ -184,36 +318,48 @@ def get_summary():
 
         closed_pnl = db.execute("SELECT COALESCE(SUM(pnl_dollar), 0) FROM trades WHERE status IN ('WIN','LOSS')").fetchone()[0]
 
-        open_trades = db.execute("SELECT * FROM trades WHERE status='OPEN'").fetchall()
+        # Fixed: SELECT specific columns + batch fetch prices
+        open_trades = db.execute("SELECT id, symbol, direction, entry_price, entry_option_price, status FROM trades WHERE status='OPEN'").fetchall()
+
+        # Collect symbols for batch fetch
+        symbols = set(t["symbol"] for t in open_trades)
+        prices = get_live_prices_batch(list(symbols))
+
         open_pnl = 0.0
         for t in open_trades:
             try:
-                pnl_pct, pnl_dollar = calculate_pnl(dict(t))
+                current_price = prices.get(t["symbol"])
+                pnl_pct, pnl_dollar = calculate_pnl(dict(t), current_price)
                 open_pnl += pnl_dollar
-            except:
-                pass
+            except Exception as e:
+                log.debug(f"Error calculating open trade P&L: {e}")
 
         total_pnl = closed_pnl + open_pnl
         db.close()
+
+        win_rate = f"{(wins/total*100):.1f}%" if total > 0 else "0%"
 
         return jsonify({
             "total_trades": total,
             "win_count": wins,
             "loss_count": losses,
             "open_count": open_count,
-            "win_rate": f"{(wins/total*100):.1f}%" if total > 0 else "0%",
+            "win_rate": win_rate,
             "closed_pnl": round(closed_pnl, 2),
             "open_pnl": round(open_pnl, 2),
             "total_pnl": round(total_pnl, 2),
-            "timestamp": datetime.now(EST).strftime("%m/%d %H:%M:%S EST")
+            "timestamp": now_est.strftime("%m/%d %H:%M:%S EST")
         })
     except Exception as e:
-        log.error(f"Summary error: {e}")
-        return jsonify({"error": str(e)}), 500
+        log.exception(f"Summary error: {e}")
+        return jsonify({"error": escape(str(e))}), 500
 
 @app.route("/")
 def dashboard():
     return render_template_string(HTML)
+
+# Initialize database indexes on startup (idempotent)
+_init_db_indexes()
 
 HTML = """
 <!DOCTYPE html>
@@ -418,6 +564,17 @@ HTML = """
     </div>
 
     <script>
+    function escapeHtml(text) {
+        const map = {
+            '&': '&amp;',
+            '<': '&lt;',
+            '>': '&gt;',
+            '"': '&quot;',
+            "'": '&#039;'
+        };
+        return String(text).replace(/[&<>"']/g, m => map[m]);
+    }
+
     function formatPnl(value) {
         return value >= 0 ? '+$' + value.toFixed(2) : '-$' + Math.abs(value).toFixed(2);
     }
@@ -428,7 +585,7 @@ HTML = """
             .then(r => r.json())
             .then(data => {
                 if (data.error) {
-                    showError('Error loading summary: ' + data.error);
+                    showError('Error loading summary: ' + escapeHtml(data.error));
                     return;
                 }
 
@@ -436,19 +593,19 @@ HTML = """
                 html += '<div class="summary-card"><label>Total P&L</label><div class="value ' + (data.total_pnl >= 0 ? 'positive' : 'negative') + '">' + formatPnl(data.total_pnl) + '</div></div>';
                 html += '<div class="summary-card"><label>Open Positions</label><div class="value">' + data.open_count + '</div></div>';
                 html += '<div class="summary-card"><label>Wins / Losses</label><div class="value">' + data.win_count + ' / ' + data.loss_count + '</div></div>';
-                html += '<div class="summary-card"><label>Win Rate</label><div class="value">' + data.win_rate + '</div></div>';
+                html += '<div class="summary-card"><label>Win Rate</label><div class="value">' + escapeHtml(data.win_rate) + '</div></div>';
 
                 document.getElementById('summary').innerHTML = html;
                 document.getElementById('timestamp').textContent = data.timestamp;
             })
-            .catch(err => showError('Error: ' + err.message));
+            .catch(err => showError('Error: ' + escapeHtml(err.message)));
 
         // Load positions
         fetch('/api/positions')
             .then(r => r.json())
             .then(data => {
                 if (data.error) {
-                    showError('Error loading positions: ' + data.error);
+                    showError('Error loading positions: ' + escapeHtml(data.error));
                     return;
                 }
 
@@ -474,8 +631,8 @@ HTML = """
 
                         // Header
                         html += '<div class="position-header">';
-                        html += '<div class="position-symbol">' + pos.symbol + '</div>';
-                        html += '<div class="position-meta">' + pos.expiry + ' • ' + pos.entry_time + ' • ' + pos.days_held + 'd</div>';
+                        html += '<div class="position-symbol">' + escapeHtml(pos.symbol) + '</div>';
+                        html += '<div class="position-meta">' + escapeHtml(pos.expiry) + ' • ' + escapeHtml(pos.entry_time) + ' • ' + pos.days_held + 'd</div>';
                         html += '</div>';
 
                         // Body
@@ -488,18 +645,18 @@ HTML = """
                             if (pos.legs && pos.legs.length > 0) {
                                 pos.legs.forEach(leg => {
                                     html += '<div class="leg">';
-                                    html += '<span class="leg-type">' + leg.type + ' $' + leg.strike.toFixed(0) + '</span>';
+                                    html += '<span class="leg-type">' + escapeHtml(leg.type) + ' $' + leg.strike.toFixed(0) + '</span>';
                                     html += '<span class="leg-price">$' + leg.price.toFixed(2) + '</span>';
                                     html += '</div>';
                                 });
                             }
 
                             html += '</div>';
-                            html += '<div class="status-badge ' + pos.status.toLowerCase() + '">' + pos.status + '</div>';
+                            html += '<div class="status-badge ' + pos.status.toLowerCase() + '">' + escapeHtml(pos.status) + '</div>';
                         } else {
-                            html += '<div class="position-type">' + pos.direction + ' $' + pos.strike.toFixed(0) + '</div>';
+                            html += '<div class="position-type">' + escapeHtml(pos.direction) + ' $' + pos.strike.toFixed(0) + '</div>';
                             html += '<div style="font-size: 13px; color: #666; margin-bottom: 12px;">Entry: $' + pos.entry_price.toFixed(2) + '</div>';
-                            html += '<div class="status-badge ' + pos.status.toLowerCase() + '">' + pos.status + '</div>';
+                            html += '<div class="status-badge ' + pos.status.toLowerCase() + '">' + escapeHtml(pos.status) + '</div>';
                         }
 
                         html += '</div>';
@@ -520,11 +677,15 @@ HTML = """
 
                 document.getElementById('positions').innerHTML = html;
             })
-            .catch(err => showError('Error: ' + err.message));
+            .catch(err => showError('Error: ' + escapeHtml(err.message)));
     }
 
     function showError(msg) {
-        document.getElementById('error-container').innerHTML = '<div class="error">' + msg + '</div>';
+        let errorDiv = document.createElement('div');
+        errorDiv.className = 'error';
+        errorDiv.textContent = msg;  // Use textContent instead of innerHTML to prevent XSS
+        document.getElementById('error-container').innerHTML = '';
+        document.getElementById('error-container').appendChild(errorDiv);
     }
 
     // Initial load
@@ -536,3 +697,9 @@ HTML = """
 </body>
 </html>
 """
+
+if __name__ == "__main__":
+    import os
+    port = int(os.getenv("DASHBOARD_PORT", 3004))
+    host = os.getenv("DASHBOARD_HOST", "0.0.0.0")
+    app.run(host=host, port=port, debug=False, threaded=True)
