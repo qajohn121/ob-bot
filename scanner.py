@@ -656,7 +656,23 @@ def score_for_call(d, w=None, sentiment=None):
         score -= 8
         reasons.append("⚠️ Wide bid/ask spread")
 
-    return min(100, max(0, score)), " | ".join(reasons[:3]) if reasons else "Mixed signals"
+    # ── NEW: Insider buying signal (Phase 3B) ─────────────────────────────────
+    # Insider accumulation is a strong bullish signal for calls
+    if d.get("insider_buying_score", 0) > 15:
+        score += int(d.get("insider_buying_score", 0) * 0.4)
+        accumulation = d.get("accumulation_type", "")
+        if accumulation == "accumulation":
+            reasons.append("💰 Insider accumulation")
+        else:
+            reasons.append("💰 Insider buying")
+
+    # ── NEW: Options flow signal (Phase 3B) ──────────────────────────────────
+    # Bullish flow (more calls) boosts call scores
+    if d.get("options_flow_score", 0) > 5:
+        score += d.get("options_flow_score", 0)
+        reasons.append(f"📊 Bullish options flow")
+
+    return min(100, max(0, score)), " | ".join(reasons[:4]) if reasons else "Mixed signals"
 
 def score_for_put(d, w=None, sentiment=None):
     """Score for PUT. Optional sentiment param adds -15 to +15 adjustment."""
@@ -746,17 +762,26 @@ def score_for_put(d, w=None, sentiment=None):
         score -= 8
         reasons.append("⚠️ Wide bid/ask spread")
 
-    return min(100, max(0, score)), " | ".join(reasons[:3]) if reasons else "Bearish signals"
+    # ── NEW: Options flow signal for PUTS (Phase 3B) ──────────────────────────
+    # Bearish flow (more puts) boosts put scores
+    if d.get("options_flow_score", 0) < -5:
+        score += abs(d.get("options_flow_score", 0))
+        reasons.append(f"📊 Bearish options flow")
+
+    return min(100, max(0, score)), " | ".join(reasons[:4]) if reasons else "Bearish signals"
 
 # ── Minimum score thresholds — never show a trade below these ─────────────────
-# PHASE 3A: Lowered thresholds to generate 2-4 trades/day with new sentiment metrics
-# Previous: {"0DTE": 75, "7DTE": 70, "21DTE": 68, "30DTE": 65, "60DTE": 60}
-MIN_SCORE = {"0DTE": 65, "7DTE": 58, "21DTE": 55, "30DTE": 52, "60DTE": 48}
+# PHASE 3B: AGGRESSIVE MODE — 5+ quality credit spreads daily with 50%+ profit targets
+# Thresholds lowered to generate more trades, paired with sentiment metrics for quality
+# Historical: {"0DTE": 75, "7DTE": 70, "21DTE": 68, "30DTE": 65, "60DTE": 60}
+# Moderate:   {"0DTE": 65, "7DTE": 58, "21DTE": 55, "30DTE": 52, "60DTE": 48}
+# AGGRESSIVE: Focus on 21/30DTE iron condors and spreads for consistent 50%+ returns
+MIN_SCORE = {"0DTE": 45, "7DTE": 42, "21DTE": 40, "30DTE": 38, "60DTE": 32}
 
 # ── Minimum conviction gap — prevents ambiguous signals ─────────────────────
-# A signal is meaningless when call_score ≈ put_score. Require sufficient directional confidence.
-# Also lowered slightly to allow more trades with sentiment backing
-MIN_CONVICTION_GAP = {"0DTE": 15, "7DTE": 12, "21DTE": 12, "30DTE": 10, "60DTE": 8}
+# Aggressive mode: require strong directional clarity for spreads
+# Lowered to allow multi-leg spreads with good underlying sentiment
+MIN_CONVICTION_GAP = {"0DTE": 10, "7DTE": 8, "21DTE": 8, "30DTE": 6, "60DTE": 5}
 
 # ── DTE Profile Pickers ───────────────────────────────────────────────────────
 def _pick_0dte(results):
